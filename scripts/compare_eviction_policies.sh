@@ -7,6 +7,9 @@
 #
 # Requires a running Python environment with the sglang repo checked out locally.
 
+# Using ShareGPT, 
+# mean: 291, p90: 718.7, p99: 2147.76
+
 set -euo pipefail
 
 REPO_ROOT="/u/jchen61/sglang"
@@ -15,18 +18,19 @@ export PYTHONPATH
 
 MODEL_PATH="${MODEL_PATH:-qwen/qwen2.5-0.5b-instruct}"
 HOST="0.0.0.0"
-PORT="${PORT:-31000}"
+PORT="${PORT:-30000}"
 LOG_LEVEL="${LOG_LEVEL:-warning}"
 DATASET="sharegpt"
-NUM_PROMPTS="${NUM_PROMPTS:-1000}"
-REQUEST_RATES="${REQUEST_RATES:-4,8,16,32}"
+NUM_PROMPTS="${NUM_PROMPTS:-1500}"
+REQUEST_RATES="${REQUEST_RATES:-5, 10, 20}"
 RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/benchmark_results}"
 mkdir -p "${RESULT_DIR}"
 
 IFS=',' read -ra REQUEST_RATE_LIST <<< "${REQUEST_RATES}"
 
-TLRU_THRESHOLD="${TLRU_THRESHOLD:-512}"
-TLRU_NEXT_PROMPT_ESTIMATE="${TLRU_NEXT_PROMPT_ESTIMATE:-128}"
+TLRU_THRESHOLD="${TLRU_THRESHOLD:-1500}"
+TLRU_NEXT_PROMPT_ESTIMATE="${TLRU_NEXT_PROMPT_ESTIMATE:-300}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-20000}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600}"
 WAIT_POLL_INTERVAL="${WAIT_POLL_INTERVAL:-2}"
 
@@ -53,13 +57,26 @@ wait_for_server() {
 start_server() {
   local policy="$1"
   local extra="${POLICY_EXTRA[$policy]}"
+
+  local -a args=(
+    --model-path "${MODEL_PATH}"
+    --host "${HOST}"
+    --port "${PORT}"
+    --log-level "${LOG_LEVEL}"
+    --radix-eviction-policy "${policy}"
+  )
+  if [[ -n "${MAX_TOTAL_TOKENS}" ]]; then
+    args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
+  fi
+
+  local -a extra_args=()
+  if [[ -n "${extra}" ]]; then
+    read -ra extra_args <<< "${extra}"
+  fi
+
   python3 -m sglang.launch_server \
-    --model-path "${MODEL_PATH}" \
-    --host "${HOST}" \
-    --port "${PORT}" \
-    --log-level "${LOG_LEVEL}" \
-    --radix-eviction-policy "${policy}" \
-    ${extra} \
+    "${args[@]}" \
+    "${extra_args[@]}" \
     > "${RESULT_DIR}/${policy}_server.log" 2>&1 &
   SERVER_PID=$!
   echo "Started ${policy} server (pid ${SERVER_PID}). Waiting for readiness..."
@@ -102,7 +119,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for policy in tlru lru lfu; do
+for policy in tlru; do
   echo "==== Running ${policy} benchmark ===="
   start_server "${policy}"
   run_benchmark "${policy}" || true
