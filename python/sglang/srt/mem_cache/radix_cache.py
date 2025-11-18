@@ -88,7 +88,7 @@ class TreeNode:
 
         self.hit_count = 0
         self.total_tokens = 0
-        self.logical_total_tokens = 0
+        self.convo_length = 0
         self.tel_trimmed = False
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
@@ -257,7 +257,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.root_node.total_tokens = 0
-        self.root_node.logical_total_tokens = 0
+        self.root_node.convo_length = 0
         self.root_node.tel_trimmed = False
         self.evictable_size_ = 0
         self.protected_size_ = 0
@@ -493,19 +493,12 @@ class RadixCache(BasePrefixCache):
 
     def total_size(self):
         return self._total_size_helper()
-
+        
     def evict(self, num_tokens: int):
         if self.disable:
             return
 
         leaves = self._collect_leaves()
-        if getattr(self, "eviction_policy_name", None) == "tlru":
-            trimmed = self._apply_tlru_trimming(leaves, num_tokens)
-            if trimmed >= num_tokens:
-                return
-            num_tokens -= trimmed
-            leaves = self._collect_leaves()
-
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
@@ -520,6 +513,54 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
+            # TLRU: Apply tail-trimming before evicting entire nodes
+            if self.eviction_policy_name == "tlru":
+                # Calculate safe budget: how much cache we need to keep for this conversation
+                # safe_budget = max(conversation_depth + predicted_next_turn - threshold, 0)
+                safe_budget = max(x.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0)
+
+                # If the node has more cache than the safe budget, we can trim the tail
+                # This is safe because:
+                # 1. We only collect leaf nodes (no children to update)
+                # 2. We update all metadata (total_tokens, convo_length, evictable_size_)
+                # 3. We properly free the evicted tail via the allocator
+                if len(x.value) > safe_budget:
+                    if safe_budget > 0:
+                        # Trim the tail: keep safe_budget tokens, evict the rest
+                        trim_amount = len(x.value) - safe_budget
+                        tail_to_evict = x.value[safe_budget:]
+
+                        # Update node data structures
+                        x.value = x.value[:safe_budget]
+                        x.key = x.key[:safe_budget]
+
+                        # CRITICAL: Update node metadata to prevent inconsistencies
+                        x.total_tokens -= trim_amount
+                        x.convo_length -= trim_amount
+                        x.tel_trimmed = True
+
+                        # Free the evicted tail
+                        self.token_to_kv_pool_allocator.free(tail_to_evict)
+                        num_evicted += trim_amount
+                        self.evictable_size_ -= trim_amount
+
+                        # Re-add trimmed node to heap with updated priority
+                        new_priority = self.eviction_strategy.get_priority(x)
+                        heapq.heappush(eviction_heap, (new_priority, x))
+                    else:
+                        # Safe budget is 0, evict the entire node
+                        self.token_to_kv_pool_allocator.free(x.value)
+                        num_evicted += len(x.value)
+                        self._delete_leaf(x)
+
+                        if len(x.parent.children) == 0:
+                            new_priority = self.eviction_strategy.get_priority(x.parent)
+                            heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+                        self._record_remove_event(x)
+                    continue
+
+            # Standard eviction: remove entire leaf node
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
@@ -529,6 +570,7 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -619,7 +661,7 @@ class RadixCache(BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
         new_node.total_tokens = new_node.parent.total_tokens + len(new_node.value)
-        new_node.logical_total_tokens = new_node.parent.logical_total_tokens + len(new_node.key)
+        new_node.convo_length = new_node.parent.convo_length + len(new_node.key)
         new_node.tel_trimmed = child.tel_trimmed
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -662,7 +704,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             new_node.total_tokens = node.total_tokens + len(value)
-            new_node.logical_total_tokens = node.logical_total_tokens + len(key)
+            new_node.convo_length = node.convo_length + len(key)
             new_node.tel_trimmed = False
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
@@ -718,74 +760,6 @@ class RadixCache(BasePrefixCache):
                 stack.extend(cur_node.children.values())
 
         return ret_list
-
-    def _trim_leaf_tail_to_budget(self, leaf: TreeNode) -> int:
-        if leaf.value is None:
-            leaf.tel_trimmed = False
-            return 0
-
-        # Logical tokens = total conversation length
-        # TEL-safe budget = logical tokens + next prompt estimate - threshold
-        safe_budget = max(leaf.logical_total_tokens + self.tlru_next_prompt_estimate - self.tlru_threshold, 0)
-
-        remaining = leaf.total_tokens - safe_budget
-        if remaining <= 0:
-            leaf.tel_trimmed = False
-            return 0
-
-        trimmed = 0
-        node = leaf
-        trimmed_any = False
-
-        while node != self.root_node and remaining > 0:
-            if node.value is None:
-                node = node.parent
-                continue
-
-            node_len = len(node.value)
-            remove_len = min(remaining, node_len)
-
-            if remove_len == node_len:
-                self.token_to_kv_pool_allocator.free(node.value)
-                trimmed += node_len
-                remaining -= node_len
-                trimmed_any = True
-                parent = node.parent
-                self._record_remove_event(node)
-                self._delete_leaf(node)
-                node = parent
-            else:
-                split_point = node_len - remove_len
-                prefix_node = self._split_node(node.key, node, split_point)
-                tail_node = node
-                self.token_to_kv_pool_allocator.free(tail_node.value)
-                trimmed += remove_len
-                remaining -= remove_len
-                trimmed_any = True
-                self._record_remove_event(tail_node)
-                self._delete_leaf(tail_node)
-                node = prefix_node
-
-        if trimmed_any and node != self.root_node:
-            node.tel_trimmed = True
-            node.last_access_time = float("-inf")
-            node.logical_total_tokens = max(node.logical_total_tokens, leaf.logical_total_tokens)
-        elif not trimmed_any:
-            leaf.tel_trimmed = False
-
-        return trimmed
-
-    def _apply_tlru_trimming(self, leaves: List[TreeNode], required_tokens: int) -> int:
-        trimmed_total = 0
-        for leaf in leaves:
-            if leaf == self.root_node or leaf.lock_ref > 0:
-                leaf.tel_trimmed = False
-                continue
-            trimmed = self._trim_leaf_tail_to_budget(leaf)
-            trimmed_total += trimmed
-            if trimmed_total >= required_tokens:
-                break
-        return trimmed_total
 
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.

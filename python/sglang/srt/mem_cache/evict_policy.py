@@ -38,6 +38,7 @@ class FILOStrategy(EvictionStrategy):
         return -node.creation_time
 
 class TLRUStrategy(EvictionStrategy):
-    def get_priority(self, node: "TreeNode"):
-        trimmed = 0 if getattr(node, "tel_trimmed", False) else 1
-        return (trimmed, node.last_access_time)
+    def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
+        # Prioritize trimmed nodes first (0 < 1), then by LRU time
+        # tel_trimmed nodes are evicted before non-trimmed nodes
+        return (0 if node.tel_trimmed else 1, node.last_access_time)
