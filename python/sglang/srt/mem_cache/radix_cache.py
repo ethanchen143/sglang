@@ -20,12 +20,15 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import logging
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -498,78 +501,95 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
-        leaves = self._collect_leaves()
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
-
         num_evicted = 0
-        while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
 
-            if x == self.root_node:
-                break
-            if x.lock_ref > 0:
-                continue
+        # ===== TLRU Tail Trimming =====
+        # For TLRU policy, first try to trim nodes that exceed their safe budget
+        if self.eviction_policy_name == "tlru":
+            leaves = self._collect_leaves()
+            for node in leaves:
+                if num_evicted >= num_tokens:
+                    break
+                if node == self.root_node or node.lock_ref > 0:
+                    continue
 
-            # TLRU: Apply tail-trimming before evicting entire nodes
-            if self.eviction_policy_name == "tlru":
-                # Calculate safe budget: how much cache we need to keep for this conversation
-                # safe_budget = max(conversation_depth + predicted_next_turn - threshold, 0)
-                safe_budget = max(x.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0)
+                # Calculate safe budget for this conversation
+                safe_budget = max(
+                    node.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0
+                )
 
-                # If the node has more cache than the safe budget, we can trim the tail
-                # This is safe because:
-                # 1. We only collect leaf nodes (no children to update)
-                # 2. We update all metadata (total_tokens, convo_length, evictable_size_)
-                # 3. We properly free the evicted tail via the allocator
-                if len(x.value) > safe_budget:
+                # Only trim if node exceeds safe budget
+                if len(node.value) > safe_budget:
                     if safe_budget > 0:
                         # Trim the tail: keep safe_budget tokens, evict the rest
-                        trim_amount = len(x.value) - safe_budget
-                        tail_to_evict = x.value[safe_budget:]
+                        trim_amount = len(node.value) - safe_budget
+                        tail_to_evict = node.value[safe_budget:]
+
+                        logger.debug(
+                            f"[TLRU] Trimming node: convo_len={node.convo_length}, "
+                            f"cached={len(node.value)}, safe_budget={safe_budget}, "
+                            f"trimming={trim_amount} tokens"
+                        )
 
                         # Update node data structures
-                        x.value = x.value[:safe_budget]
-                        x.key = x.key[:safe_budget]
+                        node.value = node.value[:safe_budget]
+                        node.key = node.key[:safe_budget]
 
-                        # CRITICAL: Update node metadata to prevent inconsistencies
-                        x.total_tokens -= trim_amount
-                        x.convo_length -= trim_amount
-                        x.tel_trimmed = True
+                        # Update node metadata to prevent inconsistencies
+                        node.total_tokens -= trim_amount
+                        node.convo_length -= trim_amount
+                        node.tel_trimmed = True
 
                         # Free the evicted tail
                         self.token_to_kv_pool_allocator.free(tail_to_evict)
                         num_evicted += trim_amount
                         self.evictable_size_ -= trim_amount
-
-                        # Re-add trimmed node to heap with updated priority
-                        new_priority = self.eviction_strategy.get_priority(x)
-                        heapq.heappush(eviction_heap, (new_priority, x))
                     else:
                         # Safe budget is 0, evict the entire node
-                        self.token_to_kv_pool_allocator.free(x.value)
-                        num_evicted += len(x.value)
-                        self._delete_leaf(x)
+                        logger.debug(
+                            f"[TLRU] Evicting entire node (safe_budget=0): "
+                            f"convo_len={node.convo_length}, cached={len(node.value)} tokens"
+                        )
+                        self.token_to_kv_pool_allocator.free(node.value)
+                        num_evicted += len(node.value)
+                        self._delete_leaf(node)
+                        self._record_remove_event(node)
 
-                        if len(x.parent.children) == 0:
-                            new_priority = self.eviction_strategy.get_priority(x.parent)
-                            heapq.heappush(eviction_heap, (new_priority, x.parent))
+        # ===== Standard Eviction =====
+        # If we still need more tokens, fall back to standard LRU eviction
+        if num_evicted < num_tokens:
+            logger.debug(
+                f"[LRU] Still need {num_tokens - num_evicted} tokens, "
+                f"falling back to LRU eviction"
+            )
 
-                        self._record_remove_event(x)
+            leaves = self._collect_leaves()  # Re-collect since we may have modified
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node) for node in leaves
+            ]
+            heapq.heapify(eviction_heap)
+
+            while num_evicted < num_tokens and len(eviction_heap):
+                _priority, x = heapq.heappop(eviction_heap)
+
+                if x == self.root_node:
+                    break
+                if x.lock_ref > 0:
                     continue
 
-            # Standard eviction: remove entire leaf node
-            self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
-            self._delete_leaf(x)
+                logger.debug(
+                    f"[LRU] Evicting entire node: cached={len(x.value)} tokens"
+                )
 
-            if len(x.parent.children) == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                self.token_to_kv_pool_allocator.free(x.value)
+                num_evicted += len(x.value)
+                self._delete_leaf(x)
 
-            self._record_remove_event(x)
+                if len(x.parent.children) == 0:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+                self._record_remove_event(x)
 
 
     def inc_lock_ref(self, node: TreeNode):
