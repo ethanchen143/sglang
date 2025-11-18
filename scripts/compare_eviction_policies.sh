@@ -102,7 +102,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for policy in tlru; do
+for policy in tlru lru lfu; do
   echo "==== Running ${policy} benchmark ===="
   start_server "${policy}"
   run_benchmark "${policy}" || true
