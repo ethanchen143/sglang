@@ -735,6 +735,8 @@ class Scheduler(
                     ),
                     page_size=self.page_size,
                     eviction_policy=server_args.radix_eviction_policy,
+                    tlru_threshold=server_args.tlru_threshold,
+                    tlru_next_prompt_estimate=server_args.tlru_next_prompt_estimate,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
@@ -781,6 +783,8 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                     eviction_policy=server_args.radix_eviction_policy,
+                    tlru_threshold=server_args.tlru_threshold,
+                    tlru_next_prompt_estimate=server_args.tlru_next_prompt_estimate,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -791,6 +795,8 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    tlru_threshold=server_args.tlru_threshold,
+                    tlru_next_prompt_estimate=server_args.tlru_next_prompt_estimate,
                 )
 
         if (

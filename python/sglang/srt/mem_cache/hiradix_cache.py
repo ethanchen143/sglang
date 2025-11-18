@@ -45,6 +45,8 @@ class HiRadixCache(RadixCache):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
         is_eagle: bool = False,
+        tlru_threshold: int = 512,
+        tlru_next_prompt_estimate: int = 128,
     ):
 
         if hicache_io_backend == "direct":
@@ -139,6 +141,8 @@ class HiRadixCache(RadixCache):
             disable=False,
             eviction_policy=eviction_policy,
             is_eagle=is_eagle,
+            tlru_threshold=tlru_threshold,
+            tlru_next_prompt_estimate=tlru_next_prompt_estimate,
         )
 
     def _parse_storage_backend_extra_config(
@@ -335,6 +339,12 @@ class HiRadixCache(RadixCache):
 
     def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
+        if self.eviction_policy_name == "tlru":
+            trimmed = self._apply_tlru_trimming(leaves, num_tokens)
+            if trimmed >= num_tokens:
+                return
+            num_tokens -= trimmed
+            leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]

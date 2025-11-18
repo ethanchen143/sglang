@@ -313,7 +313,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | `2.0` | Type: float |
 | `--hicache-size` | The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set. | `0` | Type: int |
 | `--hicache-write-policy` | The write policy of hierarchical cache. | `write_through` | `write_back`, `write_through`, `write_through_selective` |
-| `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used. | `lru` | `lru`, `lfu` |
+| `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'tlru' enables Tail-Optimized LRU (requires TEL parameters below). | `lru` | `lru`, `lfu`, `tlru` |
+| `--tlru-threshold` | Tail latency threshold ξ (in cached blocks) that T-LRU aims to keep every conversation under. | `512` | Type: int |
+| `--tlru-next-prompt-estimate` | Estimated next prompt length Q̂ used by T-LRU when computing the TEL-safe budget. Larger values make it more conservative. | `128` | Type: int |
 | `--hicache-io-backend` | The IO backend for KV cache transfer between CPU and GPU | `kernel` | `direct`, `kernel` |
 | `--hicache-mem-layout` | The layout of host memory pool for hierarchical cache. | `layer_first` | `layer_first`, `page_first`, `page_first_direct` |
 | `--hicache-storage-backend` | The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name). | `None` | `file`, `mooncake`, `hf3fs`, `nixl`, `aibrix`, `dynamic`, `eic` |

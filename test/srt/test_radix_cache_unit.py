@@ -556,6 +556,198 @@ class TestRadixCache(unittest.TestCase):
         mock_allocator.free.assert_called()
         self.assertLess(cache.total_size(), initial_size)
 
+    def test_tlru_trim_respects_tel_budgets(self):
+        """TEL trimming should shrink conversations to their safe budgets."""
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=5,
+            tlru_next_prompt_estimate=2,
+        )
+
+        def insert_conversation(token_base: int, length: int, value_base: int):
+            tokens = list(range(token_base, token_base + length))
+            values = torch.tensor(
+                [value_base + i for i in range(length)], dtype=torch.int64
+            )
+            cache.insert(RadixKey(tokens), values)
+            return tokens, length
+
+        short_tokens, short_len = insert_conversation(10, 4, 1000)
+        long_tokens, long_len = insert_conversation(40, 12, 2000)
+
+        def safe_budget(length: int) -> int:
+            return max(length + cache.tlru_next_prompt_estimate - cache.tlru_threshold, 0)
+
+        mock_allocator.free.reset_mock()
+        cache.evict(6)
+
+        for tokens, logical_len in [(short_tokens, short_len), (long_tokens, long_len)]:
+            result = cache.match_prefix(RadixKey(tokens))
+            cached_len = len(result.device_indices)
+            if cached_len == 0:
+                continue
+            self.assertLessEqual(cached_len, safe_budget(logical_len))
+            self.assertEqual(result.last_device_node.logical_total_tokens, logical_len)
+
+        freed_lengths = [call.args[0].numel() for call in mock_allocator.free.call_args_list]
+        self.assertGreaterEqual(sum(freed_lengths), 6)
+
+    def test_tlru_eviction_prefers_trimmed_conversations(self):
+        """TEL-trimmed conversations should rank ahead of untouched ones for eviction."""
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=5,
+            tlru_next_prompt_estimate=2,
+        )
+
+        def insert_conversation(token_base: int, length: int, value_base: int):
+            tokens = list(range(token_base, token_base + length))
+            values = torch.tensor(
+                [value_base + i for i in range(length)], dtype=torch.int64
+            )
+            cache.insert(RadixKey(tokens), values)
+            return tokens, values
+
+        long_tokens, long_values = insert_conversation(0, 12, 3000)
+        medium_tokens, medium_values = insert_conversation(50, 9, 2000)
+        short_tokens, short_values = insert_conversation(100, 5, 1000)
+
+        def owner_from_tensor(tensor: torch.Tensor) -> str:
+            v = tensor.min().item()
+            if 1000 <= v < 2000:
+                return "short"
+            if 2000 <= v < 3000:
+                return "medium"
+            return "long"
+
+        trimmed_owners = set()
+        for _ in range(2):
+            mock_allocator.free.reset_mock()
+            trimmed = cache._apply_tlru_trimming(cache._collect_leaves(), 3)
+            self.assertGreaterEqual(trimmed, 3)
+            owners = {owner_from_tensor(call.args[0]) for call in mock_allocator.free.call_args_list}
+            trimmed_owners.update(owners)
+
+        self.assertGreaterEqual(len(trimmed_owners), 2)
+
+        prioritized = sorted(
+            (
+                cache.eviction_strategy.get_priority(node),
+                owner_from_tensor(node.value),
+            )
+            for node in cache._collect_leaves()
+            if node != cache.root_node
+        )
+
+        top_two_owners = [owner for _prio, owner in prioritized[:2]]
+        for owner in top_two_owners:
+            self.assertIn(owner, trimmed_owners)
+
+    def test_tlru_zero_budget_drops_conversation(self):
+        """If TEL budget is zero the entire conversation should be freed."""
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=64,
+            tlru_next_prompt_estimate=4,
+        )
+
+        tokens = list(range(20))
+        values = torch.tensor([4000 + i for i in range(20)], dtype=torch.int64)
+        cache.insert(RadixKey(tokens), values)
+
+        mock_allocator.free.reset_mock()
+        cache.evict(1)
+
+        self.assertEqual(mock_allocator.free.call_count, 1)
+        freed = mock_allocator.free.call_args_list[0][0][0]
+        self.assertEqual(freed.numel(), len(tokens))
+
+        result = cache.match_prefix(RadixKey(tokens))
+        self.assertEqual(len(result.device_indices), 0)
+
+    def test_tlru_split_trim_followed_by_eviction(self):
+        """Trimming that splits a node should leave the remainder prioritized for eviction."""
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=4,
+            tlru_next_prompt_estimate=2,
+        )
+
+        def insert_conversation(token_base: int, length: int, value_base: int):
+            tokens = list(range(token_base, token_base + length))
+            values = torch.tensor(
+                [value_base + i for i in range(length)], dtype=torch.int64
+            )
+            cache.insert(RadixKey(tokens), values)
+            return tokens, values
+
+        # Conversation that will be partially trimmed (requires split).
+        trim_tokens, trim_values = insert_conversation(10, 6, 1000)
+
+        mock_allocator.free.reset_mock()
+        cache.evict(2)  # TEL trimming should remove only the tail portion.
+
+        self.assertEqual(mock_allocator.free.call_count, 1)
+        trimmed_tail = mock_allocator.free.call_args_list[0][0][0]
+        torch.testing.assert_close(trimmed_tail, trim_values[-2:])
+
+        leaves = cache._collect_leaves()
+        trimmed_leaf = None
+        for node in leaves:
+            if node.key.token_ids == trim_tokens[: len(node.key.token_ids)] and len(
+                node.key.token_ids
+            ) == 4:
+                trimmed_leaf = node
+                break
+        self.assertIsNotNone(trimmed_leaf)
+        self.assertTrue(trimmed_leaf.tel_trimmed)
+        self.assertEqual(trimmed_leaf.logical_total_tokens, 6)
+
+        result = cache.match_prefix(RadixKey(trim_tokens))
+        self.assertEqual(len(result.device_indices), 4)
+
+        # Insert another conversation after trimming to test eviction ordering.
+        other_tokens, other_values = insert_conversation(100, 5, 2000)
+
+        def owner_from_tensor(tensor: torch.Tensor) -> str:
+            v = tensor.min().item()
+            return "trimmed" if 1000 <= v < 2000 else "other"
+
+        mock_allocator.free.reset_mock()
+        cache.evict(6)
+
+        freed_blocks = [call.args[0] for call in mock_allocator.free.call_args_list]
+        owners = [owner_from_tensor(block) for block in freed_blocks]
+
+        self.assertIn("trimmed", owners)
+        trimmed_idx = owners.index("trimmed")
+        self.assertGreater(trimmed_idx, 0)
+        self.assertEqual(freed_blocks[trimmed_idx].numel(), 4)
+
     def test_page_alignment_boundary(self):
         """Test page alignment with different sizes."""
         test_cases = [

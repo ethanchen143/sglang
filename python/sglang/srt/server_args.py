@@ -150,7 +150,7 @@ NSA_CHOICES = [
     "aiter",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "tlru"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -273,6 +273,8 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    tlru_threshold: int = 512
+    tlru_next_prompt_estimate: int = 128
 
     # Runtime options
     device: Optional[str] = None
@@ -2199,7 +2201,19 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'tlru' enables Tail-Optimized LRU.",
+        )
+        parser.add_argument(
+            "--tlru-threshold",
+            type=int,
+            default=ServerArgs.tlru_threshold,
+            help="Tail latency threshold ξ (in cached blocks) used by Tail-Optimized LRU to decide the TEL-safe budget per conversation.",
+        )
+        parser.add_argument(
+            "--tlru-next-prompt-estimate",
+            type=int,
+            default=ServerArgs.tlru_next_prompt_estimate,
+            help="Estimated next prompt length Q̂ (in blocks) for Tail-Optimized LRU. Larger values make T-LRU behave closer to vanilla LRU.",
         )
 
         # Runtime options

@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
+    TLRUStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -86,6 +87,9 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        self.total_tokens = 0
+        self.logical_total_tokens = 0
+        self.tel_trimmed = False
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -194,6 +198,8 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
+        tlru_threshold: int = 512,
+        tlru_next_prompt_estimate: int = 128,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -202,6 +208,8 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.is_eagle = is_eagle
+        self.tlru_threshold = tlru_threshold
+        self.tlru_next_prompt_estimate = tlru_next_prompt_estimate
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -220,16 +228,20 @@ class RadixCache(BasePrefixCache):
         else:
             self.key_convert_fn = lambda key: key
 
-        if eviction_policy.lower() == "lru":
+        self.eviction_policy_name = eviction_policy.lower()
+
+        if self.eviction_policy_name == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
-        elif eviction_policy.lower() == "lfu":
+        elif self.eviction_policy_name == "lfu":
             self.eviction_strategy: EvictionStrategy = LFUStrategy()
-        elif eviction_policy.lower() == "fifo":
+        elif self.eviction_policy_name == "fifo":
             self.eviction_strategy: EvictionStrategy = FIFOStrategy()
-        elif eviction_policy.lower() == "mru":
+        elif self.eviction_policy_name == "mru":
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
-        elif eviction_policy.lower() == "filo":
+        elif self.eviction_policy_name == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
+        elif self.eviction_policy_name == "tlru":
+            self.eviction_strategy: EvictionStrategy = TLRUStrategy()
         else:
             raise ValueError(
                 f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
@@ -244,6 +256,9 @@ class RadixCache(BasePrefixCache):
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
+        self.root_node.total_tokens = 0
+        self.root_node.logical_total_tokens = 0
+        self.root_node.tel_trimmed = False
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
@@ -484,6 +499,13 @@ class RadixCache(BasePrefixCache):
             return
 
         leaves = self._collect_leaves()
+        if getattr(self, "eviction_policy_name", None) == "tlru":
+            trimmed = self._apply_tlru_trimming(leaves, num_tokens)
+            if trimmed >= num_tokens:
+                return
+            num_tokens -= trimmed
+            leaves = self._collect_leaves()
+
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
@@ -562,6 +584,7 @@ class RadixCache(BasePrefixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
+        node.tel_trimmed = False
 
         child_key = self.get_child_key_fn(key)
 
@@ -569,6 +592,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            child.tel_trimmed = False
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -594,9 +618,13 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
+        new_node.total_tokens = new_node.parent.total_tokens + len(new_node.value)
+        new_node.logical_total_tokens = new_node.parent.logical_total_tokens + len(new_node.key)
+        new_node.tel_trimmed = child.tel_trimmed
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
+        child.total_tokens = new_node.total_tokens + len(child.value)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
@@ -615,6 +643,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+            node.tel_trimmed = False
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -632,6 +661,9 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            new_node.total_tokens = node.total_tokens + len(value)
+            new_node.logical_total_tokens = node.logical_total_tokens + len(key)
+            new_node.tel_trimmed = False
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
@@ -653,7 +685,7 @@ class RadixCache(BasePrefixCache):
 
                 assert key == self.get_child_key_fn(
                     child.key
-                ), f"{key=}, {self.get_child_key_fn(child.key)=}"
+                ), f"key={key}, expected={self.get_child_key_fn(child.key)}"
 
     def _delete_leaf(self, node):
         for k, v in node.parent.children.items():
@@ -686,6 +718,74 @@ class RadixCache(BasePrefixCache):
                 stack.extend(cur_node.children.values())
 
         return ret_list
+
+    def _trim_leaf_tail_to_budget(self, leaf: TreeNode) -> int:
+        if leaf.value is None:
+            leaf.tel_trimmed = False
+            return 0
+
+        # Logical tokens = total conversation length
+        # TEL-safe budget = logical tokens + next prompt estimate - threshold
+        safe_budget = max(leaf.logical_total_tokens + self.tlru_next_prompt_estimate - self.tlru_threshold, 0)
+
+        remaining = leaf.total_tokens - safe_budget
+        if remaining <= 0:
+            leaf.tel_trimmed = False
+            return 0
+
+        trimmed = 0
+        node = leaf
+        trimmed_any = False
+
+        while node != self.root_node and remaining > 0:
+            if node.value is None:
+                node = node.parent
+                continue
+
+            node_len = len(node.value)
+            remove_len = min(remaining, node_len)
+
+            if remove_len == node_len:
+                self.token_to_kv_pool_allocator.free(node.value)
+                trimmed += node_len
+                remaining -= node_len
+                trimmed_any = True
+                parent = node.parent
+                self._record_remove_event(node)
+                self._delete_leaf(node)
+                node = parent
+            else:
+                split_point = node_len - remove_len
+                prefix_node = self._split_node(node.key, node, split_point)
+                tail_node = node
+                self.token_to_kv_pool_allocator.free(tail_node.value)
+                trimmed += remove_len
+                remaining -= remove_len
+                trimmed_any = True
+                self._record_remove_event(tail_node)
+                self._delete_leaf(tail_node)
+                node = prefix_node
+
+        if trimmed_any and node != self.root_node:
+            node.tel_trimmed = True
+            node.last_access_time = float("-inf")
+            node.logical_total_tokens = max(node.logical_total_tokens, leaf.logical_total_tokens)
+        elif not trimmed_any:
+            leaf.tel_trimmed = False
+
+        return trimmed
+
+    def _apply_tlru_trimming(self, leaves: List[TreeNode], required_tokens: int) -> int:
+        trimmed_total = 0
+        for leaf in leaves:
+            if leaf == self.root_node or leaf.lock_ref > 0:
+                leaf.tel_trimmed = False
+                continue
+            trimmed = self._trim_leaf_tail_to_budget(leaf)
+            trimmed_total += trimmed
+            if trimmed_total >= required_tokens:
+                break
+        return trimmed_total
 
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.

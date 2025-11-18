@@ -36,3 +36,8 @@ class MRUStrategy(EvictionStrategy):
 class FILOStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> float:
         return -node.creation_time
+
+class TLRUStrategy(EvictionStrategy):
+    def get_priority(self, node: "TreeNode"):
+        trimmed = 0 if getattr(node, "tel_trimmed", False) else 1
+        return (trimmed, node.last_access_time)

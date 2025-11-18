@@ -79,6 +79,8 @@ class LMCRadixCache(RadixCache):
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         eviction_policy: str = "lru",
+        tlru_threshold: int = 512,
+        tlru_next_prompt_estimate: int = 128,
     ):
         super().__init__(
             req_to_token_pool=req_to_token_pool,
@@ -87,6 +89,8 @@ class LMCRadixCache(RadixCache):
             disable=disable,
             enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
+            tlru_threshold=tlru_threshold,
+            tlru_next_prompt_estimate=tlru_next_prompt_estimate,
         )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
@@ -200,6 +204,8 @@ class LMCRadixCache(RadixCache):
             new_node.key = key[start:end]
             new_node.value = token_slots[:fetched]
             new_node.parent = last_node
+            new_node.total_tokens = last_node.total_tokens + fetched
+            new_node.tel_trimmed = False
             last_node.children[self.get_child_key_fn(new_node.key)] = new_node
             last_node = new_node
 
