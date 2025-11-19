@@ -90,6 +90,7 @@ class TreeNode:
 
         self.hit_count = 0
         self.convo_length = 0
+        self.cached_tokens = 0
         self.tel_trimmed = False
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
@@ -258,6 +259,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.root_node.convo_length = 0
+        self.root_node.cached_tokens = 0
         self.root_node.tel_trimmed = False
         self.evictable_size_ = 0
         self.protected_size_ = 0
@@ -512,9 +514,9 @@ class RadixCache(BasePrefixCache):
             while num_evicted < num_tokens and len(eviction_heap):
                 _priority, node = heapq.heappop(eviction_heap)
 
-                if x == self.root_node:
+                if node == self.root_node:
                     break
-                if x.lock_ref > 0:
+                if node.lock_ref > 0:
                     continue
                 
                 # Calculate safe budget for this conversation
@@ -522,22 +524,29 @@ class RadixCache(BasePrefixCache):
                     node.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0
                 )
 
-                # Only trim if node exceeds safe budget
-                if len(node.value) > safe_budget:
+                # Only trim if conversation exceeds safe budget
+                # Compare total cached tokens for this conversation against safe budget
+                if node.cached_tokens > safe_budget:
                     if safe_budget > 0:
-                        # Trim the tail: keep safe_budget tokens, evict the rest
-                        trim_amount = len(node.value) - safe_budget
-                        tail_to_evict = node.value[safe_budget:]
+                        # Calculate how many tokens we need to evict from this conversation
+                        tokens_to_evict_total = node.cached_tokens - safe_budget
+
+                        # From this node, we can trim up to len(node.value) tokens from the tail
+                        trim_amount = min(tokens_to_evict_total, len(node.value))
+                        tail_to_evict = node.value[-trim_amount:]
 
                         logger.debug(
                             f"[TLRU] Trimming node: convo_len={node.convo_length}, "
-                            f"cached={len(node.value)}, safe_budget={safe_budget}, "
-                            f"trimming={trim_amount} tokens"
+                            f"cached_tokens={node.cached_tokens}, safe_budget={safe_budget}, "
+                            f"node.value_len={len(node.value)}, trimming={trim_amount} tokens"
                         )
 
-                        # Update node data structures
-                        node.value = node.value[:safe_budget]
-                        node.key = node.key[:safe_budget]
+                        # Update node data structures - trim from the end (tail)
+                        node.value = node.value[:-trim_amount]
+                        node.key = node.key[:-trim_amount]
+
+                        # Update cached_tokens to reflect the new total
+                        node.cached_tokens -= trim_amount
 
                         # Update node metadata to prevent inconsistencies
                         node.tel_trimmed = True
@@ -682,10 +691,12 @@ class RadixCache(BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
         new_node.convo_length = new_node.parent.convo_length + len(new_node.key)
+        new_node.cached_tokens = new_node.parent.cached_tokens + len(new_node.value)
         new_node.tel_trimmed = child.tel_trimmed
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
+        child.cached_tokens = new_node.cached_tokens + len(child.value)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
@@ -723,6 +734,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             new_node.convo_length = node.convo_length + len(key)
+            new_node.cached_tokens = node.cached_tokens + len(value)
             new_node.tel_trimmed = False
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
