@@ -546,6 +546,7 @@ class RadixCache(BasePrefixCache):
                         current = node
                         total_trimmed = 0
                         nodes_on_path = []  # For debugging
+                        trimmed_nodes = []  # Track which nodes we actually trimmed from
 
                         while tokens_remaining_to_evict > 0 and current != self.root_node:
                             # How much can we trim from this node?
@@ -554,6 +555,7 @@ class RadixCache(BasePrefixCache):
 
                             if trim_amount > 0:
                                 nodes_on_path.append((current, trim_amount, available))
+                                trimmed_nodes.append(current)  # Track for cached_tokens update
 
                                 logger.debug(
                                     f"[TLRU] Trimming node: available={available}, "
@@ -616,31 +618,36 @@ class RadixCache(BasePrefixCache):
                         num_evicted += total_trimmed
                         self.evictable_size_ -= total_trimmed
 
-                        # Update cached_tokens for the original leaf if it still exists
-                        # Check if node was deleted by seeing if it's still in parent's children
-                        leaf_still_exists = False
-                        if node.parent is not None:
-                            for child in node.parent.children.values():
-                                if child == node:
-                                    leaf_still_exists = True
-                                    break
-
-                        if leaf_still_exists:
-                            # Recalculate cached_tokens by walking from root to leaf
-                            new_cached_tokens = 0
-                            walk = node
+                        # Update cached_tokens for trimmed nodes and ALL their descendants
+                        # Even though we trim along exclusive paths, a trimmed node might
+                        # have descendants on other branches that need updating.
+                        def update_node_and_descendants(n: TreeNode):
+                            """Recursively update cached_tokens for node and all descendants."""
+                            # Recalculate this node's cached_tokens from root
+                            old_cached = n.cached_tokens
+                            new_cached = 0
+                            walk = n
                             while walk != self.root_node:
-                                new_cached_tokens += len(walk.value)
+                                new_cached += len(walk.value)
                                 walk = walk.parent
+                            n.cached_tokens = new_cached
 
-                            logger.debug(
-                                f"[TLRU] Updating leaf cached_tokens: {node.cached_tokens} -> {new_cached_tokens}"
-                            )
-                            node.cached_tokens = new_cached_tokens
-                        else:
-                            logger.debug(
-                                f"[TLRU] Original leaf was deleted, no cached_tokens update needed"
-                            )
+                            if old_cached != new_cached:
+                                logger.debug(
+                                    f"[TLRU] Updated cached_tokens: {old_cached} -> {new_cached}"
+                                )
+
+                            # Recursively update all children
+                            for child in n.children.values():
+                                update_node_and_descendants(child)
+
+                        # Update each trimmed node (in reverse order) and all descendants
+                        for trimmed_node in reversed(trimmed_nodes):
+                            # Check if node still exists
+                            if trimmed_node.parent is not None:
+                                still_exists = trimmed_node in trimmed_node.parent.children.values()
+                                if still_exists:
+                                    update_node_and_descendants(trimmed_node)
 
                         logger.debug(
                             f"[TLRU] Trim complete - total_trimmed={total_trimmed}, "
