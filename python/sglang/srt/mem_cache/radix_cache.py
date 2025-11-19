@@ -495,7 +495,13 @@ class RadixCache(BasePrefixCache):
 
     def total_size(self):
         return self._total_size_helper()
-        
+
+    def _update_cached_tokens_recursive(self, node: TreeNode, delta: int):
+        """Recursively update cached_tokens for node and all descendants."""
+        node.cached_tokens += delta
+        for child in node.children.values():
+            self._update_cached_tokens_recursive(child, delta)
+
     def evict(self, num_tokens: int):
         if self.disable:
             return
@@ -530,31 +536,61 @@ class RadixCache(BasePrefixCache):
                     if safe_budget > 0:
                         # Calculate how many tokens we need to evict from this conversation
                         tokens_to_evict_total = node.cached_tokens - safe_budget
+                        tokens_remaining_to_evict = tokens_to_evict_total
+                        initial_cached_tokens = node.cached_tokens  # Save for logging
 
-                        # From this node, we can trim up to len(node.value) tokens from the tail
-                        trim_amount = min(tokens_to_evict_total, len(node.value))
-                        tail_to_evict = node.value[-trim_amount:]
+                        # Walk up from leaf, trimming from each node's tail
+                        # We trim from child to parent (tail to head)
+                        current = node
+                        nodes_to_trim = []
+
+                        # Collect nodes from leaf to root that have values to trim
+                        while current != self.root_node and tokens_remaining_to_evict > 0:
+                            if len(current.value) > 0:
+                                nodes_to_trim.append(current)
+                            current = current.parent
+
+                        # Trim from leaf upward (reverse order to trim tail first)
+                        total_trimmed = 0
+                        for trim_node in nodes_to_trim:
+                            if tokens_remaining_to_evict == 0:
+                                break
+
+                            # Trim from this node's tail
+                            trim_amount = min(tokens_remaining_to_evict, len(trim_node.value))
+
+                            if trim_amount > 0:
+                                tail_to_evict = trim_node.value[-trim_amount:]
+
+                                logger.debug(
+                                    f"[TLRU] Trimming node at depth: "
+                                    f"node.value_len={len(trim_node.value)}, trimming={trim_amount} tokens"
+                                )
+
+                                # Update node data structures - trim from the end (tail)
+                                trim_node.value = trim_node.value[:-trim_amount]
+                                trim_node.key = trim_node.key[:-trim_amount]
+                                trim_node.tel_trimmed = True
+
+                                # Free the evicted tail
+                                self.token_to_kv_pool_allocator.free(tail_to_evict)
+
+                                # Update cached_tokens for this node and all descendants
+                                # (decrease by trim_amount since we removed tokens)
+                                self._update_cached_tokens_recursive(trim_node, -trim_amount)
+
+                                total_trimmed += trim_amount
+                                tokens_remaining_to_evict -= trim_amount
 
                         logger.debug(
-                            f"[TLRU] Trimming node: convo_len={node.convo_length}, "
-                            f"cached_tokens={node.cached_tokens}, safe_budget={safe_budget}, "
-                            f"node.value_len={len(node.value)}, trimming={trim_amount} tokens"
+                            f"[TLRU] Trimmed conversation: convo_len={node.convo_length}, "
+                            f"cached_tokens_before={initial_cached_tokens}, "
+                            f"cached_tokens_after={node.cached_tokens}, "
+                            f"safe_budget={safe_budget}, total_trimmed={total_trimmed} tokens"
                         )
 
-                        # Update node data structures - trim from the end (tail)
-                        node.value = node.value[:-trim_amount]
-                        node.key = node.key[:-trim_amount]
-
-                        # Update cached_tokens to reflect the new total
-                        node.cached_tokens -= trim_amount
-
-                        # Update node metadata to prevent inconsistencies
-                        node.tel_trimmed = True
-
-                        # Free the evicted tail
-                        self.token_to_kv_pool_allocator.free(tail_to_evict)
-                        num_evicted += trim_amount
-                        self.evictable_size_ -= trim_amount
+                        num_evicted += total_trimmed
+                        self.evictable_size_ -= total_trimmed
                     else:
                         # Safe budget is 0, evict the entire node
                         logger.debug(

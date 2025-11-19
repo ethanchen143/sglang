@@ -456,6 +456,275 @@ class TestTLRUWithPageSize(unittest.TestCase):
         self.assertLess(cache.total_size(), 100)
 
 
+class TestTLRUvsLRUBehavior(unittest.TestCase):
+    """Test that TLRU and LRU make different eviction decisions."""
+
+    def setUp(self):
+        """Reset the counter before each test."""
+        TreeNode.counter = 0
+
+    def test_tlru_vs_lru_eviction_difference(self):
+        """Verify that TLRU and LRU make different eviction decisions on same data.
+
+        Setup:
+        - Long conversation (200 tokens) accessed first
+        - Short conversation (20 tokens) accessed second (more recent)
+
+        Expected behavior:
+        - LRU: Evicts the older (long) conversation first based on access time
+        - TLRU: Trims the long conversation to its safe budget, keeps more of it
+        """
+        # Create two caches with the same configuration except eviction policy
+        mock_allocator_lru = unittest.mock.Mock()
+        mock_allocator_lru.device = torch.device("cpu")
+
+        mock_allocator_tlru = unittest.mock.Mock()
+        mock_allocator_tlru.device = torch.device("cpu")
+
+        lru_cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator_lru,
+            page_size=1,
+            eviction_policy="lru",
+        )
+
+        tlru_cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator_tlru,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=100,  # ξ = 100
+            tlru_next_prompt_estimate=20,  # Q̂ = 20
+        )
+
+        # Insert a long conversation into both caches
+        long_key = RadixKey(list(range(200)))
+        long_value = torch.arange(200, dtype=torch.int64)
+        lru_cache.insert(long_key, long_value)
+        tlru_cache.insert(long_key, long_value)
+
+        # Small delay to ensure different access times
+        time.sleep(0.01)
+
+        # Insert a short conversation into both caches (accessed more recently)
+        short_key = RadixKey(list(range(1000, 1020)))
+        short_value = torch.arange(1000, 1020, dtype=torch.int64)
+        lru_cache.insert(short_key, short_value)
+        tlru_cache.insert(short_key, short_value)
+
+        # Both caches should start with the same total
+        self.assertEqual(lru_cache.total_size(), 220)
+        self.assertEqual(tlru_cache.total_size(), 220)
+
+        # Trigger eviction of 100 tokens
+        lru_cache.evict(100)
+        tlru_cache.evict(100)
+
+        # Get final sizes
+        lru_final = lru_cache.total_size()
+        tlru_final = tlru_cache.total_size()
+
+        print(f"\n=== Eviction Behavior Comparison ===")
+        print(f"Initial: 220 tokens (200 long + 20 short)")
+        print(f"Evict: 100 tokens")
+        print(f"LRU final size: {lru_final} tokens")
+        print(f"TLRU final size: {tlru_final} tokens")
+
+        # TLRU should behave differently than LRU
+        # TLRU calculates safe budget for long conversation:
+        # safe_budget = max(200 + 20 - 100, 0) = 120
+        # So it should trim 200 - 120 = 80 tokens from long conversation
+        # Then evict the short conversation (20 tokens) to reach 100 total
+        # Final TLRU: 120 tokens (just the trimmed long conversation)
+
+        # LRU evicts entire leaf nodes (not partial)
+        # When asked to evict 100 tokens, it evicts the oldest (long conversation, 200 tokens)
+        # Final LRU: 20 tokens (just the short conversation)
+
+        # The key difference: TLRU trims, LRU evicts entire nodes
+        self.assertEqual(tlru_final, 120,
+            "TLRU should trim long conversation to safe budget (120 tokens)")
+
+        # LRU evicts entire oldest node (200 tokens), leaving only the short one
+        self.assertEqual(lru_final, 20,
+            "LRU should evict entire oldest node, leaving only short conversation")
+
+        # Verify what's actually cached to show the behavioral difference
+        lru_long_result = lru_cache.match_prefix(long_key)
+        tlru_long_result = tlru_cache.match_prefix(long_key)
+        lru_short_result = lru_cache.match_prefix(short_key)
+        tlru_short_result = tlru_cache.match_prefix(short_key)
+
+        print(f"LRU - Long conversation remaining: {len(lru_long_result.device_indices)} tokens")
+        print(f"TLRU - Long conversation remaining: {len(tlru_long_result.device_indices)} tokens")
+        print(f"LRU - Short conversation remaining: {len(lru_short_result.device_indices)} tokens")
+        print(f"TLRU - Short conversation remaining: {len(tlru_short_result.device_indices)} tokens")
+
+        # Key behavioral difference:
+        # LRU: Evicted long (oldest), kept short (newest)
+        self.assertEqual(len(lru_long_result.device_indices), 0,
+            "LRU should have evicted the long conversation")
+        self.assertEqual(len(lru_short_result.device_indices), 20,
+            "LRU should have kept the short conversation")
+
+        # TLRU: Trimmed long to safe budget, evicted short
+        self.assertEqual(len(tlru_long_result.device_indices), 120,
+            "TLRU should keep exactly safe_budget tokens of long conversation")
+        self.assertEqual(len(tlru_short_result.device_indices), 0,
+            "TLRU should have evicted the short conversation")
+
+        print(f"\n🎯 BEHAVIORAL DIFFERENCE CONFIRMED!")
+        print(f"LRU (time-based): Keeps newest (short), evicts oldest (long)")
+        print(f"TLRU (tail-optimized): Trims long to safe budget, evicts short")
+
+    def test_tlru_trims_lru_evicts_entirely(self):
+        """Verify TLRU trims tails while LRU evicts entire nodes.
+
+        This test ensures TLRU's core behavior: trimming long conversations
+        rather than evicting them entirely like LRU does.
+        """
+        mock_allocator_lru = unittest.mock.Mock()
+        mock_allocator_lru.device = torch.device("cpu")
+
+        mock_allocator_tlru = unittest.mock.Mock()
+        mock_allocator_tlru.device = torch.device("cpu")
+
+        lru_cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator_lru,
+            page_size=1,
+            eviction_policy="lru",
+        )
+
+        tlru_cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator_tlru,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=50,
+            tlru_next_prompt_estimate=10,
+        )
+
+        # Insert a single long conversation
+        key = RadixKey(list(range(150)))
+        value = torch.arange(150, dtype=torch.int64)
+        lru_cache.insert(key, value)
+        tlru_cache.insert(key, value)
+
+        # Evict 40 tokens
+        lru_cache.evict(40)
+        tlru_cache.evict(40)
+
+        # LRU: Evicts entire leaf nodes, so it will evict all 150 tokens
+        # TLRU: Trims based on safe budget
+        # safe_budget = max(150 + 10 - 50, 0) = 110
+        # Should trim to 110 tokens (evict 40)
+
+        lru_result = lru_cache.match_prefix(key)
+        tlru_result = tlru_cache.match_prefix(key)
+
+        print(f"\n=== Trimming vs Eviction Comparison ===")
+        print(f"Original: 150 tokens")
+        print(f"Evict: 40 tokens")
+        print(f"LRU remaining: {len(lru_result.device_indices)} tokens")
+        print(f"TLRU remaining: {len(tlru_result.device_indices)} tokens")
+        print(f"TLRU safe budget: 110 tokens")
+
+        # TLRU should have exactly the safe budget
+        self.assertEqual(len(tlru_result.device_indices), 110,
+            "TLRU should trim to exactly safe_budget")
+
+        # LRU evicts entire nodes, so when asked to evict 40, it evicts the whole 150-token node
+        self.assertEqual(len(lru_result.device_indices), 0,
+            "LRU evicts entire nodes, so all 150 tokens are evicted")
+
+    def test_tlru_prioritizes_long_conversations(self):
+        """Verify TLRU keeps prefixes of long conversations over short ones."""
+        mock_allocator_lru = unittest.mock.Mock()
+        mock_allocator_lru.device = torch.device("cpu")
+
+        mock_allocator_tlru = unittest.mock.Mock()
+        mock_allocator_tlru.device = torch.device("cpu")
+
+        lru_cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator_lru,
+            page_size=1,
+            eviction_policy="lru",
+        )
+
+        tlru_cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator_tlru,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=100,
+            tlru_next_prompt_estimate=20,
+        )
+
+        # Insert multiple conversations of different lengths
+        # All accessed at different times to create clear LRU ordering
+
+        # Conversation 1: Very short (30 tokens) - oldest
+        key1 = RadixKey(list(range(30)))
+        value1 = torch.arange(30, dtype=torch.int64)
+        lru_cache.insert(key1, value1)
+        tlru_cache.insert(key1, value1)
+        time.sleep(0.01)
+
+        # Conversation 2: Very long (200 tokens) - middle
+        key2 = RadixKey(list(range(1000, 1200)))
+        value2 = torch.arange(1000, 1200, dtype=torch.int64)
+        lru_cache.insert(key2, value2)
+        tlru_cache.insert(key2, value2)
+        time.sleep(0.01)
+
+        # Conversation 3: Short (40 tokens) - newest
+        key3 = RadixKey(list(range(2000, 2040)))
+        value3 = torch.arange(2000, 2040, dtype=torch.int64)
+        lru_cache.insert(key3, value3)
+        tlru_cache.insert(key3, value3)
+
+        initial_total = lru_cache.total_size()
+        self.assertEqual(initial_total, 270)  # 30 + 200 + 40
+
+        # Evict 150 tokens
+        lru_cache.evict(150)
+        tlru_cache.evict(150)
+
+        print(f"\n=== Priority Comparison ===")
+        print(f"Initial: Conv1(30) + Conv2(200) + Conv3(40) = 270 tokens")
+        print(f"Evict: 150 tokens")
+
+        # Check what each cache kept
+        lru_1 = len(lru_cache.match_prefix(key1).device_indices)
+        lru_2 = len(lru_cache.match_prefix(key2).device_indices)
+        lru_3 = len(lru_cache.match_prefix(key3).device_indices)
+
+        tlru_1 = len(tlru_cache.match_prefix(key1).device_indices)
+        tlru_2 = len(tlru_cache.match_prefix(key2).device_indices)
+        tlru_3 = len(tlru_cache.match_prefix(key3).device_indices)
+
+        print(f"LRU kept: Conv1={lru_1}, Conv2={lru_2}, Conv3={lru_3}")
+        print(f"TLRU kept: Conv1={tlru_1}, Conv2={tlru_2}, Conv3={tlru_3}")
+
+        # TLRU should prioritize keeping the long conversation (trimmed)
+        # Conv1: safe_budget = max(30 + 20 - 100, 0) = 0 (evict all)
+        # Conv2: safe_budget = max(200 + 20 - 100, 0) = 120 (trim to 120)
+        # Conv3: safe_budget = max(40 + 20 - 100, 0) = 0 (evict all)
+        # TLRU should keep: 0 + 120 + 0 = 120 tokens (evicted 150)
+
+        self.assertEqual(tlru_1, 0, "TLRU should evict short conversation 1")
+        self.assertEqual(tlru_2, 120, "TLRU should trim long conversation to safe budget")
+        self.assertEqual(tlru_3, 0, "TLRU should evict short conversation 3")
+
+        # LRU should evict oldest first (Conv1, Conv2 partially)
+        # After evicting 150: 270 - 150 = 120 remaining
+        # Should evict Conv1 (30) and 120 from Conv2, leaving Conv2(80) + Conv3(40)
+
+        print(f"\nTLRU correctly prioritizes long conversations by keeping safe budget!")
+
+
 if __name__ == "__main__":
     # Run tests with verbose output
     unittest.main(verbosity=2)
