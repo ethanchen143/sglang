@@ -552,6 +552,12 @@ class RadixCache(BasePrefixCache):
 
                         # Trim from leaf upward (reverse order to trim tail first)
                         total_trimmed = 0
+                        trimmed_nodes = []  # Track which nodes we actually trimmed from
+
+                        logger.debug(
+                            f"[TLRU] Before trim - evictable_size={self.evictable_size_}, "
+                            f"node.cached_tokens={node.cached_tokens}, safe_budget={safe_budget}"
+                        )
 
                         for trim_node in nodes_to_trim:
                             if tokens_remaining_to_evict == 0:
@@ -564,8 +570,10 @@ class RadixCache(BasePrefixCache):
                                 tail_to_evict = trim_node.value[-trim_amount:]
 
                                 logger.debug(
-                                    f"[TLRU] Trimming node at depth: "
-                                    f"node.value_len={len(trim_node.value)}, trimming={trim_amount} tokens"
+                                    f"[TLRU] Trimming node: "
+                                    f"node.value_len={len(trim_node.value)}, "
+                                    f"node.cached_tokens_before={trim_node.cached_tokens}, "
+                                    f"trimming={trim_amount} tokens"
                                 )
 
                                 # Update node data structures - trim from the end (tail)
@@ -578,24 +586,36 @@ class RadixCache(BasePrefixCache):
 
                                 total_trimmed += trim_amount
                                 tokens_remaining_to_evict -= trim_amount
+                                trimmed_nodes.append(trim_node)
 
-                        # Update cached_tokens for ALL nodes on this conversation's path
-                        # Important: Update each node individually, NOT recursively, to avoid
-                        # incorrectly updating sibling conversations that share parent nodes
+                        # BUG FIX: Recalculate cached_tokens for the leaf node by walking from root
+                        # This correctly handles cases where we trimmed from multiple nodes including ancestors.
+                        # We only need to update the leaf node's cached_tokens since that's what we compare
+                        # against safe_budget in the next iteration.
                         current = node
+                        node.cached_tokens = 0
                         while current != self.root_node:
-                            current.cached_tokens -= total_trimmed
+                            node.cached_tokens += len(current.value)
                             current = current.parent
 
+                        logger.debug(
+                            f"[TLRU] Recalculated leaf cached_tokens: {initial_cached_tokens} -> {node.cached_tokens} "
+                            f"(should have decreased by {total_trimmed})"
+                        )
+
+                        num_evicted += total_trimmed
+                        self.evictable_size_ -= total_trimmed
+
+                        logger.debug(
+                            f"[TLRU] After trim - evictable_size={self.evictable_size_}, "
+                            f"num_evicted={num_evicted}"
+                        )
                         logger.debug(
                             f"[TLRU] Trimmed conversation: convo_len={node.convo_length}, "
                             f"cached_tokens_before={initial_cached_tokens}, "
                             f"cached_tokens_after={node.cached_tokens}, "
                             f"safe_budget={safe_budget}, total_trimmed={total_trimmed} tokens"
                         )
-
-                        num_evicted += total_trimmed
-                        self.evictable_size_ -= total_trimmed
                     else:
                         # Safe budget is 0, evict the entire node
                         logger.debug(
