@@ -542,10 +542,13 @@ class RadixCache(BasePrefixCache):
                         )
 
                         # Trim along the exclusive path from leaf to first shared parent
-                        # Strategy: Start at leaf, trim upward, but STOP at any shared parent
+                        # Strategy:
+                        #   1. Start at leaf, trim value (not key!) from tail
+                        #   2. If node becomes empty, delete it and move to parent
+                        #   3. STOP if parent has other children (shared parent)
+                        #   4. This ensures we only trim along exclusive paths
                         current = node
                         total_trimmed = 0
-                        nodes_on_path = []  # For debugging
                         trimmed_nodes = []  # Track which nodes we actually trimmed from
 
                         while tokens_remaining_to_evict > 0 and current != self.root_node:
@@ -618,36 +621,34 @@ class RadixCache(BasePrefixCache):
                         num_evicted += total_trimmed
                         self.evictable_size_ -= total_trimmed
 
-                        # Update cached_tokens for trimmed nodes and ALL their descendants
-                        # Even though we trim along exclusive paths, a trimmed node might
-                        # have descendants on other branches that need updating.
-                        def update_node_and_descendants(n: TreeNode):
-                            """Recursively update cached_tokens for node and all descendants."""
-                            # Recalculate this node's cached_tokens from root
-                            old_cached = n.cached_tokens
-                            new_cached = 0
-                            walk = n
-                            while walk != self.root_node:
-                                new_cached += len(walk.value)
-                                walk = walk.parent
-                            n.cached_tokens = new_cached
+                        # Update cached_tokens for all affected nodes
+                        # Two cases to handle:
+                        #   1. Nodes we trimmed from (in trimmed_nodes)
+                        #   2. Original leaf (if we trimmed its ancestors but not the leaf itself)
+                        # Example: leaf has empty value, we trim parent - leaf needs update!
+                        nodes_to_update = set(trimmed_nodes)
 
-                            if old_cached != new_cached:
-                                logger.debug(
-                                    f"[TLRU] Updated cached_tokens: {old_cached} -> {new_cached}"
-                                )
+                        # Add original leaf if it still exists and wasn't deleted
+                        if node.parent is not None:
+                            if node in node.parent.children.values():
+                                nodes_to_update.add(node)
 
-                            # Recursively update all children
-                            for child in n.children.values():
-                                update_node_and_descendants(child)
-
-                        # Update each trimmed node (in reverse order) and all descendants
-                        for trimmed_node in reversed(trimmed_nodes):
-                            # Check if node still exists
-                            if trimmed_node.parent is not None:
-                                still_exists = trimmed_node in trimmed_node.parent.children.values()
+                        for update_node in nodes_to_update:
+                            # Double-check node still exists
+                            if update_node.parent is not None:
+                                still_exists = update_node in update_node.parent.children.values()
                                 if still_exists:
-                                    update_node_and_descendants(trimmed_node)
+                                    # Recalculate from root
+                                    old_cached = update_node.cached_tokens
+                                    new_cached = 0
+                                    walk = update_node
+                                    while walk != self.root_node:
+                                        new_cached += len(walk.value)
+                                        walk = walk.parent
+                                    update_node.cached_tokens = new_cached
+                                    logger.debug(
+                                        f"[TLRU] Updated cached_tokens: {old_cached} -> {new_cached}"
+                                    )
 
                         logger.debug(
                             f"[TLRU] Trim complete - total_trimmed={total_trimmed}, "
