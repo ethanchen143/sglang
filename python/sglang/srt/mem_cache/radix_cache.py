@@ -575,12 +575,12 @@ class RadixCache(BasePrefixCache):
                                 # Free the evicted tail
                                 self.token_to_kv_pool_allocator.free(tail_to_evict)
 
-                                # Update cached_tokens for this node and all descendants
-                                # (decrease by trim_amount since we removed tokens)
-                                self._update_cached_tokens_recursive(trim_node, -trim_amount)
-
                                 total_trimmed += trim_amount
                                 tokens_remaining_to_evict -= trim_amount
+
+                        # Update cached_tokens for the leaf node only
+                        # (it's cumulative, so decreasing it by total_trimmed is correct)
+                        node.cached_tokens -= total_trimmed
 
                         logger.debug(
                             f"[TLRU] Trimmed conversation: convo_len={node.convo_length}, "
