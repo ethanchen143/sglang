@@ -495,7 +495,7 @@ class RadixCache(BasePrefixCache):
 
     def total_size(self):
         return self._total_size_helper()
-
+        
     def evict(self, num_tokens: int):
         if self.disable:
             return
@@ -530,136 +530,31 @@ class RadixCache(BasePrefixCache):
                     if safe_budget > 0:
                         # Calculate how many tokens we need to evict from this conversation
                         tokens_to_evict_total = node.cached_tokens - safe_budget
-                        tokens_remaining_to_evict = tokens_to_evict_total
-                        initial_cached_tokens = node.cached_tokens
-                        initial_convo_length = node.convo_length
+
+                        # From this node, we can trim up to len(node.value) tokens from the tail
+                        trim_amount = min(tokens_to_evict_total, len(node.value))
+                        tail_to_evict = node.value[-trim_amount:]
 
                         logger.debug(
-                            f"[TLRU] Starting trim - evictable_size={self.evictable_size_}, "
-                            f"node.cached_tokens={node.cached_tokens}, "
-                            f"node.convo_length={node.convo_length}, "
-                            f"safe_budget={safe_budget}, need to evict={tokens_to_evict_total}"
+                            f"[TLRU] Trimming node: convo_len={node.convo_length}, "
+                            f"cached_tokens={node.cached_tokens}, safe_budget={safe_budget}, "
+                            f"node.value_len={len(node.value)}, trimming={trim_amount} tokens"
                         )
 
-                        # Trim along the exclusive path from leaf to first shared parent
-                        # Strategy:
-                        #   1. Start at leaf, trim value (not key!) from tail
-                        #   2. If node becomes empty, delete it and move to parent
-                        #   3. STOP if parent has other children (shared parent)
-                        #   4. This ensures we only trim along exclusive paths
-                        current = node
-                        total_trimmed = 0
-                        trimmed_nodes = []  # Track which nodes we actually trimmed from
+                        # Update node data structures - trim from the end (tail)
+                        node.value = node.value[:-trim_amount]
 
-                        while tokens_remaining_to_evict > 0 and current != self.root_node:
-                            # How much can we trim from this node?
-                            available = len(current.value)
-                            trim_amount = min(tokens_remaining_to_evict, available)
+                        # Update cached_tokens to reflect the new total
+                        node.cached_tokens -= trim_amount
 
-                            if trim_amount > 0:
-                                nodes_on_path.append((current, trim_amount, available))
-                                trimmed_nodes.append(current)  # Track for cached_tokens update
+                        # Update node metadata to prevent inconsistencies
+                        node.tel_trimmed = True
 
-                                logger.debug(
-                                    f"[TLRU] Trimming node: available={available}, "
-                                    f"trimming={trim_amount}, key_len={len(current.key)}"
-                                )
+                        # Free the evicted tail
+                        self.token_to_kv_pool_allocator.free(tail_to_evict)
+                        num_evicted += trim_amount
+                        self.evictable_size_ -= trim_amount
 
-                                # CRITICAL: Only trim value (KV cache), NEVER trim key (token IDs)
-                                tail_to_evict = current.value[-trim_amount:]
-                                current.value = current.value[:-trim_amount]
-                                # key stays unchanged! convo_length stays unchanged!
-                                current.tel_trimmed = True
-
-                                # Free the evicted KV cache
-                                self.token_to_kv_pool_allocator.free(tail_to_evict)
-
-                                total_trimmed += trim_amount
-                                tokens_remaining_to_evict -= trim_amount
-
-                            # If we completely emptied this node and it's a leaf, we can delete it
-                            # and potentially continue to parent
-                            if len(current.value) == 0 and len(current.children) == 0:
-                                parent = current.parent
-
-                                logger.debug(
-                                    f"[TLRU] Node emptied, deleting leaf node"
-                                )
-
-                                # Remove current node from parent's children
-                                key_to_remove = None
-                                for k, child in parent.children.items():
-                                    if child == current:
-                                        key_to_remove = k
-                                        break
-
-                                if key_to_remove is not None:
-                                    del parent.children[key_to_remove]
-
-                                # Can we continue to parent?
-                                # Only if parent has no other children (exclusive path)
-                                if len(parent.children) == 0 and parent != self.root_node:
-                                    logger.debug(
-                                        f"[TLRU] Parent now has no children, continuing to parent"
-                                    )
-                                    current = parent
-                                else:
-                                    # Parent has other children (shared) or is root, stop
-                                    logger.debug(
-                                        f"[TLRU] Parent has {len(parent.children)} other children, stopping"
-                                    )
-                                    break
-                            else:
-                                # Node still has value or children, stop here
-                                logger.debug(
-                                    f"[TLRU] Node has value_len={len(current.value)}, "
-                                    f"children={len(current.children)}, stopping"
-                                )
-                                break
-
-                        # Update evictable_size accounting
-                        num_evicted += total_trimmed
-                        self.evictable_size_ -= total_trimmed
-
-                        # Update cached_tokens for all affected nodes
-                        # Two cases to handle:
-                        #   1. Nodes we trimmed from (in trimmed_nodes)
-                        #   2. Original leaf (if we trimmed its ancestors but not the leaf itself)
-                        # Example: leaf has empty value, we trim parent - leaf needs update!
-                        nodes_to_update = set(trimmed_nodes)
-
-                        # Add original leaf if it still exists and wasn't deleted
-                        if node.parent is not None:
-                            if node in node.parent.children.values():
-                                nodes_to_update.add(node)
-
-                        for update_node in nodes_to_update:
-                            # Double-check node still exists
-                            if update_node.parent is not None:
-                                still_exists = update_node in update_node.parent.children.values()
-                                if still_exists:
-                                    # Recalculate from root
-                                    old_cached = update_node.cached_tokens
-                                    new_cached = 0
-                                    walk = update_node
-                                    while walk != self.root_node:
-                                        new_cached += len(walk.value)
-                                        walk = walk.parent
-                                    update_node.cached_tokens = new_cached
-                                    logger.debug(
-                                        f"[TLRU] Updated cached_tokens: {old_cached} -> {new_cached}"
-                                    )
-
-                        logger.debug(
-                            f"[TLRU] Trim complete - total_trimmed={total_trimmed}, "
-                            f"evictable_size={self.evictable_size_}, "
-                            f"num_evicted={num_evicted}"
-                        )
-                        logger.debug(
-                            f"[TLRU] Trimmed conversation: convo_len={initial_convo_length} (unchanged), "
-                            f"cached_tokens: {initial_cached_tokens} -> ~{initial_cached_tokens - total_trimmed}, "
-                            f"safe_budget={safe_budget}"
-                        )
                     else:
                         # Safe budget is 0, evict the entire node
                         logger.debug(
@@ -670,6 +565,10 @@ class RadixCache(BasePrefixCache):
                         num_evicted += len(node.value)
                         self._delete_leaf(node)
                         self._record_remove_event(node)
+
+                if len(node.parent.children) == 0:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         # ===== Standard Eviction =====
         # If we still need more tokens, fall back to standard LRU eviction
@@ -762,7 +661,6 @@ class RadixCache(BasePrefixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
-        node.tel_trimmed = False
 
         child_key = self.get_child_key_fn(key)
 
