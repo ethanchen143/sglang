@@ -53,7 +53,6 @@ if TYPE_CHECKING:
 
 
 class RadixKey:
-
     def __init__(self, token_ids: List[int], extra_key: Optional[str] = None):
         # token ids sequence
         self.token_ids = token_ids
@@ -90,7 +89,6 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
-        self.total_tokens = 0
         self.convo_length = 0
         self.tel_trimmed = False
         # indicating the node is locked to protect from eviction
@@ -259,7 +257,6 @@ class RadixCache(BasePrefixCache):
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
-        self.root_node.total_tokens = 0
         self.root_node.convo_length = 0
         self.root_node.tel_trimmed = False
         self.evictable_size_ = 0
@@ -507,12 +504,19 @@ class RadixCache(BasePrefixCache):
         # For TLRU policy, first try to trim nodes that exceed their safe budget
         if self.eviction_policy_name == "tlru":
             leaves = self._collect_leaves()
-            for node in leaves:
-                if num_evicted >= num_tokens:
-                    break
-                if node == self.root_node or node.lock_ref > 0:
-                    continue
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node) for node in leaves
+            ]
+            heapq.heapify(eviction_heap)
 
+            while num_evicted < num_tokens and len(eviction_heap):
+                _priority, node = heapq.heappop(eviction_heap)
+
+                if x == self.root_node:
+                    break
+                if x.lock_ref > 0:
+                    continue
+                
                 # Calculate safe budget for this conversation
                 safe_budget = max(
                     node.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0
@@ -536,8 +540,6 @@ class RadixCache(BasePrefixCache):
                         node.key = node.key[:safe_budget]
 
                         # Update node metadata to prevent inconsistencies
-                        node.total_tokens -= trim_amount
-                        node.convo_length -= trim_amount
                         node.tel_trimmed = True
 
                         # Free the evicted tail
@@ -654,7 +656,6 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            child.tel_trimmed = False
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -680,13 +681,11 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
-        new_node.total_tokens = new_node.parent.total_tokens + len(new_node.value)
         new_node.convo_length = new_node.parent.convo_length + len(new_node.key)
         new_node.tel_trimmed = child.tel_trimmed
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
-        child.total_tokens = new_node.total_tokens + len(child.value)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
@@ -723,7 +722,6 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-            new_node.total_tokens = node.total_tokens + len(value)
             new_node.convo_length = node.convo_length + len(key)
             new_node.tel_trimmed = False
             node.children[child_key] = new_node
