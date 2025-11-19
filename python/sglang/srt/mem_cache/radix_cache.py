@@ -496,12 +496,6 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    def _update_cached_tokens_recursive(self, node: TreeNode, delta: int):
-        """Recursively update cached_tokens for node and all descendants."""
-        node.cached_tokens += delta
-        for child in node.children.values():
-            self._update_cached_tokens_recursive(child, delta)
-
     def evict(self, num_tokens: int):
         if self.disable:
             return
@@ -621,6 +615,32 @@ class RadixCache(BasePrefixCache):
                         # Update evictable_size accounting
                         num_evicted += total_trimmed
                         self.evictable_size_ -= total_trimmed
+
+                        # Update cached_tokens for the original leaf if it still exists
+                        # Check if node was deleted by seeing if it's still in parent's children
+                        leaf_still_exists = False
+                        if node.parent is not None:
+                            for child in node.parent.children.values():
+                                if child == node:
+                                    leaf_still_exists = True
+                                    break
+
+                        if leaf_still_exists:
+                            # Recalculate cached_tokens by walking from root to leaf
+                            new_cached_tokens = 0
+                            walk = node
+                            while walk != self.root_node:
+                                new_cached_tokens += len(walk.value)
+                                walk = walk.parent
+
+                            logger.debug(
+                                f"[TLRU] Updating leaf cached_tokens: {node.cached_tokens} -> {new_cached_tokens}"
+                            )
+                            node.cached_tokens = new_cached_tokens
+                        else:
+                            logger.debug(
+                                f"[TLRU] Original leaf was deleted, no cached_tokens update needed"
+                            )
 
                         logger.debug(
                             f"[TLRU] Trim complete - total_trimmed={total_trimmed}, "
