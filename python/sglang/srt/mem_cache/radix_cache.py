@@ -552,6 +552,7 @@ class RadixCache(BasePrefixCache):
 
                         # Trim from leaf upward (reverse order to trim tail first)
                         total_trimmed = 0
+
                         for trim_node in nodes_to_trim:
                             if tokens_remaining_to_evict == 0:
                                 break
@@ -578,9 +579,13 @@ class RadixCache(BasePrefixCache):
                                 total_trimmed += trim_amount
                                 tokens_remaining_to_evict -= trim_amount
 
-                        # Update cached_tokens for the leaf node only
-                        # (it's cumulative, so decreasing it by total_trimmed is correct)
-                        node.cached_tokens -= total_trimmed
+                        # Update cached_tokens for ALL nodes on this conversation's path
+                        # Important: Update each node individually, NOT recursively, to avoid
+                        # incorrectly updating sibling conversations that share parent nodes
+                        current = node
+                        while current != self.root_node:
+                            current.cached_tokens -= total_trimmed
+                            current = current.parent
 
                         logger.debug(
                             f"[TLRU] Trimmed conversation: convo_len={node.convo_length}, "
