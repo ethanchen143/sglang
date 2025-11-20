@@ -184,6 +184,8 @@ class TestTLRUEviction(unittest.TestCase):
         result_before = cache.match_prefix(key)
         leaf_before = result_before.last_device_node
         convo_length_before = leaf_before.convo_length
+        # convo_length should equal the original conversation length (len(key))
+        self.assertEqual(convo_length_before, len(key.token_ids))
 
         # Trigger eviction to force TLRU trimming
         cache.evict(40)  # Evict 40 tokens
@@ -198,6 +200,137 @@ class TestTLRUEviction(unittest.TestCase):
                 convo_length_before,
                 "convo_length should never change after trimming"
             )
+
+    def test_cached_tokens_matches_device_indices_before_and_after_trim(self):
+        """Ensure cached_tokens matches the actual number of cached KV indices.
+
+        Before and after TLRU trimming, cached_tokens on the leaf should equal
+        the length of the device_indices returned by match_prefix for that
+        conversation, while convo_length remains the logical conversation length.
+        """
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=50,
+            tlru_next_prompt_estimate=10,
+        )
+
+        # Insert a long conversation
+        key = RadixKey(list(range(100)))
+        value = torch.arange(100, dtype=torch.int64)
+        cache.insert(key, value)
+
+        # Before trimming, cached_tokens should equal the number of KV indices
+        result_before = cache.match_prefix(key)
+        leaf_before = result_before.last_device_node
+        self.assertEqual(
+            leaf_before.cached_tokens,
+            len(result_before.device_indices),
+        )
+        self.assertEqual(leaf_before.convo_length, len(key.token_ids))
+
+        # Trigger eviction to force TLRU trimming
+        # Safe budget = max(100 + 10 - 50, 0) = 60, so we trim 40 tokens
+        cache.evict(40)
+
+        result_after = cache.match_prefix(key)
+        # After trimming, the cached_tokens and returned KV length should match
+        if result_after.last_device_node is not None:
+            leaf_after = result_after.last_device_node
+            self.assertEqual(
+                leaf_after.cached_tokens,
+                len(result_after.device_indices),
+            )
+            # convo_length remains the original logical conversation length
+            self.assertEqual(leaf_after.convo_length, len(key.token_ids))
+
+    def test_convo_and_cached_tokens_with_multiple_conversations_and_evictions(self):
+        """Multiple conversations: insert, evict, then insert again and verify invariants.
+
+        - convo_length should always equal the logical conversation length for that leaf.
+        - cached_tokens should equal the currently cached KV length for that conversation.
+        - Prior evictions/trims of other conversations must not corrupt these invariants.
+        """
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            eviction_policy="tlru",
+            tlru_threshold=60,
+            tlru_next_prompt_estimate=10,
+        )
+
+        # Conversation 1: long
+        key1 = RadixKey(list(range(100)))
+        value1 = torch.arange(100, dtype=torch.int64)
+        cache.insert(key1, value1)
+
+        # Conversation 2: medium, disjoint tokens
+        key2 = RadixKey(list(range(1000, 1050)))
+        value2 = torch.arange(1000, 1050, dtype=torch.int64)
+        cache.insert(key2, value2)
+
+        # Before eviction: both should have convo_length == len(key) and
+        # cached_tokens == number of KV indices returned by match_prefix.
+        r1_before = cache.match_prefix(key1)
+        leaf1_before = r1_before.last_device_node
+        self.assertEqual(leaf1_before.convo_length, len(key1.token_ids))
+        self.assertEqual(leaf1_before.cached_tokens, len(r1_before.device_indices))
+
+        r2_before = cache.match_prefix(key2)
+        leaf2_before = r2_before.last_device_node
+        self.assertEqual(leaf2_before.convo_length, len(key2.token_ids))
+        self.assertEqual(leaf2_before.cached_tokens, len(r2_before.device_indices))
+
+        # Evict enough to force trimming/eviction:
+        # Conv1: length=100 -> safe_budget = max(100 + 10 - 60, 0) = 50
+        # Conv2: length=50  -> safe_budget = max(50 + 10 - 60, 0) = 0 (evict all)
+        cache.evict(80)
+
+        # After eviction:
+        # - Conv1 should be trimmed to its safe_budget (~50 tokens).
+        # - Conv2 should be fully evicted (0 tokens).
+        r1_after = cache.match_prefix(key1)
+        if r1_after.last_device_node is not None:
+            leaf1_after = r1_after.last_device_node
+            # convo_length is logical conversation length and never changes
+            self.assertEqual(leaf1_after.convo_length, len(key1.token_ids))
+            # cached_tokens equals the currently cached KV length for conv1
+            self.assertEqual(leaf1_after.cached_tokens, len(r1_after.device_indices))
+            # We expect trimming, so cached_tokens should be < original length
+            self.assertLess(leaf1_after.cached_tokens, len(key1.token_ids))
+
+        r2_after = cache.match_prefix(key2)
+        # Conv2 should have no cached prefix remaining
+        self.assertEqual(len(r2_after.device_indices), 0)
+
+        # Now insert a third conversation after eviction.
+        key3 = RadixKey(list(range(2000, 2030)))
+        value3 = torch.arange(2000, 2030, dtype=torch.int64)
+        cache.insert(key3, value3)
+
+        r3 = cache.match_prefix(key3)
+        leaf3 = r3.last_device_node
+        # For the new conversation, convo_length should be its logical length,
+        # and cached_tokens should equal its current KV length.
+        self.assertEqual(leaf3.convo_length, len(key3.token_ids))
+        self.assertEqual(leaf3.cached_tokens, len(r3.device_indices))
+
+        # Re-insert Conv2 and ensure its new leaf has consistent metadata,
+        # not affected by prior eviction history.
+        cache.insert(key2, value2)
+        r2_new = cache.match_prefix(key2)
+        leaf2_new = r2_new.last_device_node
+        self.assertEqual(leaf2_new.convo_length, len(key2.token_ids))
+        self.assertEqual(leaf2_new.cached_tokens, len(r2_new.device_indices))
 
     def test_tlru_trimming_updates_cached_tokens(self):
         """Test that TLRU trimming correctly updates cached_tokens.

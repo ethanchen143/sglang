@@ -567,8 +567,8 @@ class RadixCache(BasePrefixCache):
                         self._record_remove_event(node)
 
                 if len(node.parent.children) == 0:
-                    new_priority = self.eviction_strategy.get_priority(x.parent)
-                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+                    new_priority = self.eviction_strategy.get_priority(node.parent)
+                    heapq.heappush(eviction_heap, (new_priority, node.parent))
 
         # ===== Standard Eviction =====
         # If we still need more tokens, fall back to standard LRU eviction
@@ -614,9 +614,14 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.key)
-                self.protected_size_ += len(node.key)
-                delta -= len(node.key)
+                size = (
+                    len(node.value)
+                    if self.eviction_policy_name == "tlru" and node.value is not None
+                    else len(node.key)
+                )
+                self.evictable_size_ -= size
+                self.protected_size_ += size
+                delta -= size
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -628,9 +633,14 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.key)
-                self.protected_size_ -= len(node.key)
-                delta += len(node.key)
+                size = (
+                    len(node.value)
+                    if self.eviction_policy_name == "tlru" and node.value is not None
+                    else len(node.key)
+                )
+                self.evictable_size_ += size
+                self.protected_size_ -= size
+                delta += size
             node.lock_ref -= 1
             if node.parent is None:
                 assert (
@@ -718,7 +728,6 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            node.tel_trimmed = False
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -740,7 +749,8 @@ class RadixCache(BasePrefixCache):
             new_node.cached_tokens = node.cached_tokens + len(value)
             new_node.tel_trimmed = False
             node.children[child_key] = new_node
-            self.evictable_size_ += len(key)
+            size = len(value) if self.eviction_policy_name == "tlru" else len(key)
+            self.evictable_size_ += size
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -767,7 +777,12 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        size = (
+            len(node.value)
+            if self.eviction_policy_name == "tlru" and node.value is not None
+            else len(node.key)
+        )
+        self.evictable_size_ -= size
 
     def _total_size_helper(self):
         total_size = 0
