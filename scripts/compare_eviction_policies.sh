@@ -43,7 +43,7 @@ TLRU_NEXT_PROMPT_ESTIMATE="${TLRU_NEXT_PROMPT_ESTIMATE:-300}"
 
 # Control KV cache capacity via static memory fraction instead of explicit token cap.
 # mem_fraction_static ~= (model weights + KV cache pool) / GPU memory capacity.
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.1}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.05}"
 
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600}"
 WAIT_POLL_INTERVAL="${WAIT_POLL_INTERVAL:-2}"

@@ -6,17 +6,14 @@ from typing import TYPE_CHECKING, Tuple, Union
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
 
-
 class EvictionStrategy(ABC):
     @abstractmethod
     def get_priority(self, node: "TreeNode") -> Union[float, Tuple]:
         pass
 
-
 class LRUStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> float:
         return node.last_access_time
-
 
 class LFUStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
@@ -39,6 +36,4 @@ class FILOStrategy(EvictionStrategy):
 
 class TLRUStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
-        # Prioritize trimmed nodes first (0 < 1), then by LRU time
-        # tel_trimmed nodes are evicted before non-trimmed nodes
-        return (0 if node.tel_trimmed else 1, node.last_access_time)
+        return node.last_access_time

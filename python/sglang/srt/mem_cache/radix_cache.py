@@ -91,7 +91,7 @@ class TreeNode:
         self.hit_count = 0
         self.convo_length = 0
         self.cached_tokens = 0
-        self.tel_trimmed = False
+
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -260,7 +260,6 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.root_node.convo_length = 0
         self.root_node.cached_tokens = 0
-        self.root_node.tel_trimmed = False
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
@@ -513,7 +512,6 @@ class RadixCache(BasePrefixCache):
 
             while num_evicted < num_tokens and len(eviction_heap):
                 _priority, node = heapq.heappop(eviction_heap)
-
                 if node == self.root_node:
                     break
                 if node.lock_ref > 0:
@@ -524,65 +522,20 @@ class RadixCache(BasePrefixCache):
                     node.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0
                 )
 
-                # Only trim if conversation exceeds safe budget
                 # Compare total cached tokens for this conversation against safe budget
-                if node.cached_tokens > safe_budget and len(node.value) > 0:
-                    if safe_budget > 0:
-                        # Calculate how many tokens we need to evict from this conversation
-                        tokens_to_evict_total = node.cached_tokens - safe_budget
+                if node.cached_tokens > safe_budget:
+                    # evict the entire node
+                    logger.debug(
+                        f"[TLRU] Evicting entire node (safe_budget=0): "
+                        f"convo_len={node.convo_length}, cached={len(node.value)} tokens"
+                        f"node.value_len={len(node.value)}, safe_budget={safe_budget}"
+                    )
+                    self.token_to_kv_pool_allocator.free(node.value)
+                    num_evicted += len(node.value)
+                    self._delete_leaf(node)
+                    self._record_remove_event(node)
 
-                        # From this node, we can trim up to len(node.value) tokens from the tail
-                        trim_amount = min(tokens_to_evict_total, len(node.value))
-
-                        if trim_amount > 0:
-                            tail_to_evict = node.value[-trim_amount:]
-
-                            logger.debug(
-                                f"[TLRU] Trimming node: convo_len={node.convo_length}, "
-                                f"cached_tokens={node.cached_tokens}, safe_budget={safe_budget}, "
-                                f"node.value_len={len(node.value)}, trimming={trim_amount} tokens"
-                            )
-
-                            # Update node data structures - trim from the end (tail)
-                            node.value = node.value[:-trim_amount]
-
-                            # Update cached_tokens for this node and all ancestors
-                            node.cached_tokens -= trim_amount
-                            self._update_ancestor_cached_tokens(node, -trim_amount)
-
-                            # Update node metadata to prevent inconsistencies
-                            node.tel_trimmed = True
-
-                            # Free the evicted tail
-                            self.token_to_kv_pool_allocator.free(tail_to_evict)
-                            num_evicted += trim_amount
-
-                            # Only update evictable_size if the node is evictable
-                            if node.lock_ref == 0:
-                                self.evictable_size_ = max(0, self.evictable_size_ - trim_amount)
-
-                            # If node becomes empty after trimming, delete it
-                            if len(node.value) == 0:
-                                self._delete_leaf(node)
-                                self._record_remove_event(node)
-
-                    else:
-                        # Safe budget is 0, evict the entire node
-                        logger.debug(
-                            f"[TLRU] Evicting entire node (safe_budget=0): "
-                            f"convo_len={node.convo_length}, cached={len(node.value)} tokens"
-                        )
-                        evict_size = len(node.value)
-                        if evict_size > 0:
-                            self.token_to_kv_pool_allocator.free(node.value)
-                            num_evicted += evict_size
-                            # Update cached_tokens for ancestors before deleting
-                            self._update_ancestor_cached_tokens(node, -evict_size)
-                        self._delete_leaf(node)
-                        self._record_remove_event(node)
-
-                # Check if parent should be added to the heap
-                if node.parent and len(node.parent.children) == 0 and node.parent != self.root_node:
+                if len(node.parent.children) == 0:
                     new_priority = self.eviction_strategy.get_priority(node.parent)
                     heapq.heappush(eviction_heap, (new_priority, node.parent))
 
@@ -601,32 +554,25 @@ class RadixCache(BasePrefixCache):
             heapq.heapify(eviction_heap)
 
             while num_evicted < num_tokens and len(eviction_heap):
-                _priority, x = heapq.heappop(eviction_heap)
-
-                if x == self.root_node:
+                _priority, node = heapq.heappop(eviction_heap)
+                if node == self.root_node:
                     break
-                if x.lock_ref > 0:
+                if node.lock_ref > 0:
                     continue
 
                 logger.debug(
-                    f"[LRU] Evicting entire node: cached={len(x.value)} tokens"
+                    f"[LRU] Evicting entire node: cached={len(node.value)} tokens"
                 )
 
-                evict_size = len(x.value)
-                if evict_size > 0:
-                    self.token_to_kv_pool_allocator.free(x.value)
-                    num_evicted += evict_size
-                    # Update cached_tokens for ancestors in TLRU mode
-                    if self.eviction_policy_name == "tlru":
-                        self._update_ancestor_cached_tokens(x, -evict_size)
+                self.token_to_kv_pool_allocator.free(node.value)
+                num_evicted += len(node.value)
+                self._delete_leaf(node)
 
-                self._delete_leaf(x)
+                if len(node.parent.children) == 0:
+                    new_priority = self.eviction_strategy.get_priority(node.parent)
+                    heapq.heappush(eviction_heap, (new_priority, node.parent))
 
-                if x.parent and len(x.parent.children) == 0 and x.parent != self.root_node:
-                    new_priority = self.eviction_strategy.get_priority(x.parent)
-                    heapq.heappush(eviction_heap, (new_priority, x.parent))
-
-                self._record_remove_event(x)
+                self._record_remove_event(node)
 
 
     def inc_lock_ref(self, node: TreeNode):
@@ -636,15 +582,9 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                size = (
-                    len(node.value)
-                    if self.eviction_policy_name == "tlru" and node.value is not None
-                    else len(node.key)
-                )
-                # Defensive check to prevent negative evictable_size_
-                self.evictable_size_ = max(0, self.evictable_size_ - size)
-                self.protected_size_ += size
-                delta -= size
+                self.evictable_size_ -= len(node.key)
+                self.protected_size_ += len(node.key)
+                delta -= len(node.key)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -656,15 +596,9 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                size = (
-                    len(node.value)
-                    if self.eviction_policy_name == "tlru" and node.value is not None
-                    else len(node.key)
-                )
-                self.evictable_size_ += size
-                # Defensive check to prevent negative protected_size_
-                self.protected_size_ = max(0, self.protected_size_ - size)
-                delta += size
+                self.evictable_size_ += len(node.key)
+                self.protected_size_ -= len(node.key)
+                delta += len(node.key)
             node.lock_ref -= 1
             if node.parent is None:
                 assert (
@@ -727,48 +661,12 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
-
-        # Calculate convo_length for new_node based on parent
-        if hasattr(new_node.parent, 'convo_length'):
-            new_node.convo_length = new_node.parent.convo_length + len(new_node.key)
-        else:
-            new_node.convo_length = len(new_node.key)
-
-        # For TLRU, properly calculate cached_tokens
-        if self.eviction_policy_name == "tlru":
-            # New node's cached_tokens is its value plus the sum of its children's cached_tokens
-            # Since it only has one child (the original child node), we need to account for that
-            # First, update child's cached_tokens for its new smaller value
-            old_child_cached_tokens = child.cached_tokens if hasattr(child, 'cached_tokens') else len(child.value)
-            child.value = child.value[split_len:]
-            child.cached_tokens = len(child.value)
-
-            # Now calculate cached_tokens for subtrees rooted at child
-            for grandchild in child.children.values():
-                if hasattr(grandchild, 'cached_tokens'):
-                    child.cached_tokens += grandchild.cached_tokens
-
-            # New node's cached_tokens includes its own value and child's subtree
-            new_node.cached_tokens = len(new_node.value) + child.cached_tokens
-
-            # Propagate to ancestors if needed (splitting shouldn't change total)
-            # But we need to ensure consistency
-            if hasattr(new_node.parent, 'cached_tokens'):
-                # The parent's cached_tokens shouldn't change from the split
-                pass
-        else:
-            new_node.cached_tokens = 0
-            child.cached_tokens = 0
-
-        new_node.tel_trimmed = child.tel_trimmed if hasattr(child, 'tel_trimmed') else False
-
+        new_node.convo_length = new_node.parent.convo_length + len(new_node.key)
+        new_node.cached_tokens = new_node.parent.cached_tokens + len(new_node.value)
         child.parent = new_node
         child.key = child.key[split_len:]
-
-        # Update child's convo_length
-        if hasattr(new_node, 'convo_length'):
-            child.convo_length = new_node.convo_length + len(child.key)
-
+        child.value = child.value[split_len:]
+        child.cached_tokens = new_node.cached_tokens + len(child.value)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
@@ -804,31 +702,10 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-
-            # Initialize TLRU-specific fields
-            if self.eviction_policy_name == "tlru":
-                # Set convo_length based on parent
-                if hasattr(node, 'convo_length'):
-                    new_node.convo_length = node.convo_length + len(key)
-                else:
-                    new_node.convo_length = len(key)
-
-                # Set cached_tokens for this node (just its value since it has no children)
-                new_node.cached_tokens = len(value)
-                new_node.tel_trimmed = False
-
-                # Update cached_tokens for all ancestors
-                self._update_ancestor_cached_tokens(new_node, len(value))
-
-                size = len(value)
-            else:
-                new_node.convo_length = 0
-                new_node.cached_tokens = 0
-                new_node.tel_trimmed = False
-                size = len(key)
-
+            new_node.convo_length = node.convo_length + len(key)
+            new_node.cached_tokens = node.cached_tokens + len(value)
             node.children[child_key] = new_node
-            self.evictable_size_ += size
+            self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -855,21 +732,7 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        size = (
-            len(node.value)
-            if self.eviction_policy_name == "tlru" and node.value is not None
-            else len(node.key)
-        )
-        # Only update evictable_size if the node was actually evictable (not locked)
-        if node.lock_ref == 0:
-            self.evictable_size_ = max(0, self.evictable_size_ - size)
-
-    def _update_ancestor_cached_tokens(self, node: TreeNode, delta: int):
-        """Update cached_tokens for all ancestors when a node's value changes."""
-        current = node.parent
-        while current is not None:
-            current.cached_tokens += delta
-            current = current.parent
+        self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):
         total_size = 0
