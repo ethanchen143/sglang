@@ -22,13 +22,13 @@ REPO_ROOT="/u/jchen61/sglang"
 PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 export PYTHONPATH
 
-MODEL_PATH="${MODEL_PATH:-qwen/qwen2.5-0.5b-instruct}"
+MODEL_PATH="${MODEL_PATH:-meta-llama/Meta-Llama-3-8B-Instruct}"
 HOST="0.0.0.0"
 PORT="${PORT:-30000}"
 LOG_LEVEL="${LOG_LEVEL:-debug}"
 DATASET="sharegpt"
 NUM_PROMPTS="${NUM_PROMPTS:-500}"
-REQUEST_RATES="${REQUEST_RATES:-2,4}"
+REQUEST_RATES="${REQUEST_RATES:-1,2}"
 RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/benchmark_results}"
 mkdir -p "${RESULT_DIR}"
 
@@ -43,7 +43,7 @@ TLRU_NEXT_PROMPT_ESTIMATE="${TLRU_NEXT_PROMPT_ESTIMATE:-300}"
 
 # Control KV cache capacity via static memory fraction instead of explicit token cap.
 # mem_fraction_static ~= (model weights + KV cache pool) / GPU memory capacity.
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.05}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.1}"
 
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600}"
 WAIT_POLL_INTERVAL="${WAIT_POLL_INTERVAL:-2}"

@@ -501,8 +501,7 @@ class RadixCache(BasePrefixCache):
 
         num_evicted = 0
 
-        # ===== TLRU Tail Trimming =====
-        # For TLRU policy, first try to trim nodes that exceed their safe budget
+        # TLRU Tail Trimming
         if self.eviction_policy_name == "tlru":
             leaves = self._collect_leaves()
             eviction_heap = [
@@ -517,19 +516,20 @@ class RadixCache(BasePrefixCache):
                 if node.lock_ref > 0:
                     continue
 
-                # Calculate safe budget for this conversation
+                # Calculate safe budget (amount of cache we need to stay under SLO) for this conversation
                 safe_budget = max(
                     node.convo_length + self.tlru_next_prompt_estimate - self.tlru_threshold, 0
                 )
 
                 # Compare total cached tokens for this conversation against safe budget
-                if node.cached_tokens > safe_budget:
+                if (node.cached_tokens - len(node.value)) > safe_budget:
+                    node.cached_tokens -= len(node.value)
                     # evict the entire node
-                    logger.debug(
-                        f"[TLRU] Evicting entire node (safe_budget=0): "
-                        f"convo_len={node.convo_length}, cached={len(node.value)} tokens"
-                        f"node.value_len={len(node.value)}, safe_budget={safe_budget}"
-                    )
+                    # logger.debug(
+                    #     f"[TLRU] Evicting entire node (safe_budget=0): "
+                    #     f"convo_len={node.convo_length}, cached={node.cached_tokens}, "
+                    #     f"len(node.value)={len(node.value)}, safe_budget={safe_budget}"
+                    # )
                     self.token_to_kv_pool_allocator.free(node.value)
                     num_evicted += len(node.value)
                     self._delete_leaf(node)
@@ -539,13 +539,12 @@ class RadixCache(BasePrefixCache):
                     new_priority = self.eviction_strategy.get_priority(node.parent)
                     heapq.heappush(eviction_heap, (new_priority, node.parent))
 
-        # ===== Standard Eviction =====
-        # If we still need more tokens, fall back to standard LRU eviction
+        # Standard Eviction
         if num_evicted < num_tokens:
-            logger.debug(
-                f"[LRU] Still need {num_tokens - num_evicted} tokens, "
-                f"falling back to LRU eviction"
-            )
+            # logger.debug(
+            #     f"[LRU] Still need {num_tokens - num_evicted} tokens, "
+            #     f"falling back to LRU eviction"
+            # )
 
             leaves = self._collect_leaves()  # Re-collect since we may have modified
             eviction_heap = [
@@ -560,9 +559,9 @@ class RadixCache(BasePrefixCache):
                 if node.lock_ref > 0:
                     continue
 
-                logger.debug(
-                    f"[LRU] Evicting entire node: cached={len(node.value)} tokens"
-                )
+                # logger.debug(
+                #     f"[LRU] Evicting entire node: cached={len(node.value)} tokens"
+                # )
 
                 self.token_to_kv_pool_allocator.free(node.value)
                 num_evicted += len(node.value)
@@ -573,7 +572,6 @@ class RadixCache(BasePrefixCache):
                     heapq.heappush(eviction_heap, (new_priority, node.parent))
 
                 self._record_remove_event(node)
-
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
