@@ -22,15 +22,20 @@ REPO_ROOT="/u/jchen61/sglang"
 PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
 export PYTHONPATH
 
-MODEL_PATH="${MODEL_PATH:-meta-llama/Meta-Llama-3-8B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-meta-llama/Llama-3.1-8B-Instruct}"
 HOST="0.0.0.0"
 PORT="${PORT:-30000}"
 LOG_LEVEL="${LOG_LEVEL:-debug}"
 DATASET="sharegpt"
 NUM_PROMPTS="${NUM_PROMPTS:-500}"
-REQUEST_RATES="${REQUEST_RATES:-1,2}"
-RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/benchmark_results}"
+REQUEST_RATES="${REQUEST_RATES:-4,8,16}"
+RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/benchmark_results_1500}"
 mkdir -p "${RESULT_DIR}"
+BASE_RESULT_DIR="${RESULT_DIR}"
+# Control KV cache capacity via a fixed set of memory fractions instead of an external argument.
+# mem_fraction ~= (model weights + KV cache pool) / GPU memory capacity.
+# Update this list to change the sweep.
+MEM_FRACTION_LIST=(0.6 0.75 0.9)
 
 # Optional: path to a prepared Loogle dataset (e.g., longdep_qa.json).
 # Leave empty to use the default behavior of the HiCache benchmark script.
@@ -38,12 +43,8 @@ DATASET_PATH="${DATASET_PATH:-}"
 
 IFS=',' read -ra REQUEST_RATE_LIST <<< "${REQUEST_RATES}"
 
-TLRU_THRESHOLD="${TLRU_THRESHOLD:-500}"
+TLRU_THRESHOLD="${TLRU_THRESHOLD:-1500}"
 TLRU_NEXT_PROMPT_ESTIMATE="${TLRU_NEXT_PROMPT_ESTIMATE:-300}"
-
-# Control KV cache capacity via static memory fraction instead of explicit token cap.
-# mem_fraction_static ~= (model weights + KV cache pool) / GPU memory capacity.
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.1}"
 
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-600}"
 WAIT_POLL_INTERVAL="${WAIT_POLL_INTERVAL:-2}"
@@ -70,6 +71,7 @@ wait_for_server() {
 
 start_server() {
   local policy="$1"
+  local mem_fraction="$2"
   local extra="${POLICY_EXTRA[$policy]}"
 
   local -a args=(
@@ -82,8 +84,8 @@ start_server() {
 
   # Note: we intentionally do NOT enable hierarchical cache here.
   # This benchmark uses pure GPU radix cache with different eviction policies.
-  if [[ -n "${MEM_FRACTION_STATIC}" ]]; then
-    args+=(--mem-fraction-static "${MEM_FRACTION_STATIC}")
+  if [[ -n "${mem_fraction}" ]]; then
+    args+=(--mem-fraction-static "${mem_fraction}")
   fi
 
   local -a extra_args=()
@@ -130,6 +132,8 @@ run_benchmark() {
       --model "${MODEL_PATH}" \
       --dataset-name "${DATASET}" \
       --num-prompts "${NUM_PROMPTS}" \
+      --fixed-output-len 512 \
+      --max-concurrency 16 \
       --request-rate "${rate}" \
       --enable-multiturn \
       --disable-shuffle \
@@ -138,16 +142,107 @@ run_benchmark() {
   done
 }
 
+summarize_hit_rate() {
+  # Aggregate KV cache hit rate from scheduler logs.
+  # We parse the "Prefill batch" log lines emitted by `log_prefill_stats`
+  # in `scheduler_metrics_mixin.py`, which contain "#new-token" and
+  # "#cached-token" fields.
+  local policy="$1"
+  local logfile="${RESULT_DIR}/${policy}_server.log"
+  local outfile="${RESULT_DIR}/${policy}_hit_rate.txt"
+
+  if [[ ! -f "${logfile}" ]]; then
+    echo "No server log found for policy ${policy} at ${logfile}" >&2
+    return
+  fi
+
+  echo "Summarizing cache hit rate for policy ${policy} -> ${outfile}"
+  grep "Prefill batch" "${logfile}" | awk '
+    {
+      if (match($0, /#new-token: ([0-9]+)/, a) && match($0, /#cached-token: ([0-9]+)/, b)) {
+        new = a[1]
+        cached = b[1]
+        total_new += new
+        total_cached += cached
+      }
+    }
+    END {
+      total = total_new + total_cached
+      if (total > 0) {
+        rate = total_cached / total
+        printf "prefill_cache_hit_rate=%.6f\tcached_tokens=%d\ttotal_tokens=%d\n", rate, total_cached, total
+      } else {
+        print "prefill_cache_hit_rate=0"
+      }
+    }
+  ' > "${outfile}" || true
+}
+
+add_hit_rate_to_jsonl_files() {
+  # Parse the summarized hit rate and inject it into all JSONL result files
+  # for the given policy in the current RESULT_DIR.
+  local policy="$1"
+  local summary_file="${RESULT_DIR}/${policy}_hit_rate.txt"
+
+  if [[ ! -f "${summary_file}" ]]; then
+    echo "No hit-rate summary for policy ${policy} at ${summary_file}" >&2
+    return
+  fi
+
+  local hit_rate
+  hit_rate="$(awk -F'[=\t]' '/prefill_cache_hit_rate=/{print $2; exit}' "${summary_file}")"
+  if [[ -z "${hit_rate}" ]]; then
+    echo "Failed to parse prefill_cache_hit_rate from ${summary_file}" >&2
+    return
+  fi
+
+  echo "Annotating JSONL files for policy ${policy} with prefill_cache_hit_rate=${hit_rate}"
+
+  local f
+  for f in "${RESULT_DIR}/${policy}_${DATASET}_"*rps.jsonl; do
+    [[ -f "${f}" ]] || continue
+    python3 - "$f" "$hit_rate" << 'EOF'
+import json
+import sys
+
+path = sys.argv[1]
+rate = float(sys.argv[2])
+
+with open(path) as f:
+    lines = [json.loads(l) for l in f if l.strip()]
+
+for obj in lines:
+    obj["prefill_cache_hit_rate"] = rate
+
+with open(path, "w") as f:
+    for obj in lines:
+        f.write(json.dumps(obj) + "\n")
+EOF
+  done
+}
+
 cleanup() {
   stop_server
 }
 trap cleanup EXIT
 
-for policy in tlru lru; do
-  echo "==== Running ${policy} benchmark ===="
-  start_server "${policy}"
-  run_benchmark "${policy}" || true
-  stop_server
+for mem_fraction in "${MEM_FRACTION_LIST[@]}"; do
+  mem_fraction="$(echo "${mem_fraction}" | xargs)"
+  [[ -z "${mem_fraction}" ]] && continue
+
+  RESULT_DIR="${BASE_RESULT_DIR}/mem_${mem_fraction}"
+  mkdir -p "${RESULT_DIR}"
+
+  echo "==== Running benchmarks with mem_fraction=${mem_fraction} (results in ${RESULT_DIR}) ===="
+
+  for policy in tlru lru; do
+    echo "==== Running ${policy} benchmark ===="
+    start_server "${policy}" "${mem_fraction}"
+    run_benchmark "${policy}" || true
+    summarize_hit_rate "${policy}" || true
+    add_hit_rate_to_jsonl_files "${policy}" || true
+    stop_server
+  done
 done
 
-echo "Benchmark results saved to ${RESULT_DIR}."
+echo "Benchmark results saved to ${BASE_RESULT_DIR}."

@@ -1,0 +1,1 @@
+prefill_cache_hit_rate=0.163306	cached_tokens=1025977	total_tokens=6282538

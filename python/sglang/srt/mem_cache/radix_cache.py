@@ -522,29 +522,42 @@ class RadixCache(BasePrefixCache):
                 )
 
                 # Compare total cached tokens for this conversation against safe budget
-                if (node.cached_tokens - len(node.value)) > safe_budget:
-                    node.cached_tokens -= len(node.value)
-                    # evict the entire node
-                    # logger.debug(
-                    #     f"[TLRU] Evicting entire node (safe_budget=0): "
-                    #     f"convo_len={node.convo_length}, cached={node.cached_tokens}, "
-                    #     f"len(node.value)={len(node.value)}, safe_budget={safe_budget}"
-                    # )
-                    self.token_to_kv_pool_allocator.free(node.value)
-                    num_evicted += len(node.value)
-                    self._delete_leaf(node)
-                    self._record_remove_event(node)
+                if node.cached_tokens > safe_budget:
+                    if node.cached_tokens - len(node.value) >= safe_budget:
+                        # evict the entire node
+                        node.cached_tokens -= len(node.value)
+                        logger.debug(
+                            f"[TLRU] Evicting entire node (safe_budget=0): "
+                            f"convo_len={node.convo_length}, cached={node.cached_tokens}, "
+                            f"len(node.value)={len(node.value)}, safe_budget={safe_budget}"
+                        )
+                        self.token_to_kv_pool_allocator.free(node.value)
+                        num_evicted += len(node.value)
+                        self._delete_leaf(node)
+                        self._record_remove_event(node)
 
-                if len(node.parent.children) == 0:
-                    new_priority = self.eviction_strategy.get_priority(node.parent)
-                    heapq.heappush(eviction_heap, (new_priority, node.parent))
+                        if len(node.parent.children) == 0:
+                            new_priority = self.eviction_strategy.get_priority(node.parent)
+                            heapq.heappush(eviction_heap, (new_priority, node.parent))
+                    else:
+                        # evict the partial part of the node
+                        amount_to_remove = node.cached_tokens - safe_budget
+                        keep_len = len(node.value) - amount_to_remove
+                        self._split_node(node.key, node, keep_len)
+
+                        logger.debug(f"[TLRU] Splitting node. Keeping {keep_len}, Evicting {len(node.value)}")
+                                                    
+                        self.token_to_kv_pool_allocator.free(node.value)
+                        num_evicted += amount_to_remove
+                        self._delete_leaf(node)
+                        self._record_remove_event(node)
 
         # Standard Eviction
         if num_evicted < num_tokens:
-            # logger.debug(
-            #     f"[LRU] Still need {num_tokens - num_evicted} tokens, "
-            #     f"falling back to LRU eviction"
-            # )
+            logger.debug(
+                f"[LRU] Still need {num_tokens - num_evicted} tokens, "
+                f"falling back to LRU eviction"
+            )
 
             leaves = self._collect_leaves()  # Re-collect since we may have modified
             eviction_heap = [
@@ -559,9 +572,9 @@ class RadixCache(BasePrefixCache):
                 if node.lock_ref > 0:
                     continue
 
-                # logger.debug(
-                #     f"[LRU] Evicting entire node: cached={len(node.value)} tokens"
-                # )
+                logger.debug(
+                    f"[LRU] Evicting entire node: cached={len(node.value)} tokens"
+                )
 
                 self.token_to_kv_pool_allocator.free(node.value)
                 num_evicted += len(node.value)

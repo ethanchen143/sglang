@@ -1,0 +1,1 @@
+sharegpt, llama3.1-8b, 1500 threhold, 300 next turn prediction, hicache multiturn
