@@ -972,12 +972,21 @@ class Scheduler(
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
+        server_args = self.server_args
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            uniboost_gamma=server_args.uniboost_gamma,
+            uniboost_k=server_args.uniboost_k,
+            uniboost_adaptive_gamma=server_args.uniboost_adaptive_gamma,
+            uniboost_beta=server_args.uniboost_beta,
+            uniboost_gamma_min=server_args.uniboost_gamma_min,
+            uniboost_gamma_max=server_args.uniboost_gamma_max,
+            uniboost_gamma_update_interval=server_args.uniboost_gamma_update_interval,
+            uniboost_gamma_min_samples=server_args.uniboost_gamma_min_samples,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0

@@ -43,6 +43,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.managers.schedule_uniboost_policy import (
+    current_gamma, init_tracker, priority_for_req,
+)  
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -91,6 +94,7 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    UNIBOOST = "uniboost"  # UniBoost scheduling policy
 
 
 class SchedulePolicy:
@@ -103,6 +107,14 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        uniboost_gamma=3e-4,
+        uniboost_k=128,
+        uniboost_adaptive_gamma=True,
+        uniboost_beta=0.3,
+        uniboost_gamma_min=1e-6,
+        uniboost_gamma_max=1.0,
+        uniboost_gamma_update_interval=50,
+        uniboost_gamma_min_samples=2000
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -110,6 +122,21 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+
+        self.uniboost_gamma = uniboost_gamma
+        self.uniboost_k = uniboost_k
+        # Only allocate the gamma tracker when UniBoost is the active policy;
+        # otherwise record_completion / current_gamma short-circuit to no-ops.
+        is_uniboost = self.policy == CacheAgnosticPolicy.UNIBOOST
+        init_tracker(
+            initial_gamma=uniboost_gamma,
+            adaptive=is_uniboost and uniboost_adaptive_gamma,
+            beta=uniboost_beta,
+            gamma_min=uniboost_gamma_min,
+            gamma_max=uniboost_gamma_max,
+            update_interval=uniboost_gamma_update_interval,
+            min_samples=uniboost_gamma_min_samples,
+        )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -154,6 +181,10 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.UNIBOOST:
+                SchedulePolicy._sort_by_uniboost(
+                    waiting_queue, self.uniboost_gamma, self.uniboost_k,
+                )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -343,6 +374,11 @@ class SchedulePolicy:
         if _ROUTING_KEY_POLICY_DEBUG_LOG:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
+
+    @staticmethod
+    def _sort_by_uniboost(waiting_queue, gamma_default, k):
+        gamma = current_gamma(gamma_default)
+        waiting_queue.sort(key=lambda r: priority_for_req(r, gamma, k))
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:

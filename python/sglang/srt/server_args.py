@@ -356,6 +356,16 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
+    # UniBoost (--schedule-policy uniboost): faithful port of Algorithm 1 + 2
+    # from the paper. Only consulted when schedule_policy == "uniboost".
+    uniboost_gamma: float = 3e-4
+    uniboost_k: int = 128
+    uniboost_adaptive_gamma: bool = True
+    uniboost_beta: float = 0.3
+    uniboost_gamma_min: float = 1e-6
+    uniboost_gamma_max: float = 1.0
+    uniboost_gamma_update_interval: int = 50
+    uniboost_gamma_min_samples: int = 2000
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
     default_priority_value: Optional[int] = None
@@ -4394,8 +4404,57 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "uniboost",
             ],
             help="The scheduling policy of the requests.",
+        )
+        parser.add_argument(
+            "--uniboost-gamma",
+            type=float,
+            default=ServerArgs.uniboost_gamma,
+            help="UniBoost: initial gamma for the boost curve.",
+        )
+        parser.add_argument(
+            "--uniboost-k",
+            type=int,
+            default=ServerArgs.uniboost_k,
+            help="UniBoost: MemGuard bin size (Quantize anchor).",
+        )
+        parser.add_argument(
+            "--uniboost-adaptive-gamma",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.uniboost_adaptive_gamma,
+            help="UniBoost: enable EMA-smoothed gamma-Ada (UpdateGamma).",
+        )
+        parser.add_argument(
+            "--uniboost-beta",
+            type=float,
+            default=ServerArgs.uniboost_beta,
+            help="UniBoost: EMA weight on the new gamma estimate.",
+        )
+        parser.add_argument(
+            "--uniboost-gamma-min",
+            type=float,
+            default=ServerArgs.uniboost_gamma_min,
+            help="UniBoost: lower clip on adaptive gamma.",
+        )
+        parser.add_argument(
+            "--uniboost-gamma-max",
+            type=float,
+            default=ServerArgs.uniboost_gamma_max,
+            help="UniBoost: upper clip on adaptive gamma.",
+        )
+        parser.add_argument(
+            "--uniboost-gamma-update-interval",
+            type=int,
+            default=ServerArgs.uniboost_gamma_update_interval,
+            help="UniBoost: completions between UpdateGamma invocations.",
+        )
+        parser.add_argument(
+            "--uniboost-gamma-min-samples",
+            type=int,
+            default=ServerArgs.uniboost_gamma_min_samples,
+            help="UniBoost: min latency samples before UpdateGamma fires.",
         )
         parser.add_argument(
             "--enable-priority-scheduling",

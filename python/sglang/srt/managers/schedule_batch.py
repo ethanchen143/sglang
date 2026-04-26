@@ -60,6 +60,10 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.schedule_uniboost_policy import (
+    current_gamma,
+    priority_for_req,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
@@ -2072,14 +2076,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # requests from the back, so we can only retract from the back.
         # TODO(sang): Clean up finish path and support better retract
         # policy.
+
         if not server_args.speculative_algorithm:
-            sorted_indices.sort(
-                key=lambda i: (
-                    len(self.reqs[i].output_ids),
-                    -len(self.reqs[i].origin_input_ids),
-                ),
-                reverse=True,
-            )
+            if server_args.schedule_policy == "uniboost":
+                # SelectVictim: largest pi (= lowest priority) is retracted first.
+                # Sort ascending so pop() takes the largest-pi req from the end.
+                gamma = current_gamma(server_args.uniboost_gamma)
+                k = server_args.uniboost_k
+                sorted_indices.sort(
+                    key=lambda i: priority_for_req(self.reqs[i], gamma, k)
+                )
+            else:
+                sorted_indices.sort(
+                    key=lambda i: (
+                        len(self.reqs[i].output_ids),
+                        -len(self.reqs[i].origin_input_ids),
+                    ),
+                    reverse=True,
+                )
 
         retracted_reqs = []
         first_iter = True

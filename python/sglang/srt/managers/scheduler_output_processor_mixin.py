@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.schedule_uniboost_policy import record_completion
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 
@@ -198,6 +199,7 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        record_completion(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -332,6 +334,7 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        record_completion(req)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -573,6 +576,7 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
+            record_completion(req)
 
         self.maybe_collect_customized_info(i, req, logits_output)
 
