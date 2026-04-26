@@ -47,7 +47,23 @@ mkdir -p "$OUTDIR"
 [[ -s "$DATASET" ]] || { echo "missing $DATASET. run: python build_dataset.py --out $DATASET --total $NUM_PROMPTS"; exit 1; }
 
 SERVER_PID=""
-cleanup() { [[ -n "${SERVER_PID:-}" ]] && kill -TERM "$SERVER_PID" 2>/dev/null || true; }
+gpu_used_mb() {
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+        | awk 'NR==1 {print $1+0}'
+}
+cleanup() {
+    pkill -TERM -f "sglang\.launch_server" 2>/dev/null || true
+    pkill -TERM -f "sglang.srt"           2>/dev/null || true
+    sleep 5
+    pkill -KILL -f "sglang\.launch_server" 2>/dev/null || true
+    pkill -KILL -f "sglang.srt"           2>/dev/null || true
+    # Wait until GPU memory drops below 2 GB (or 30s, whichever first).
+    for _ in $(seq 1 30); do
+        used=$(gpu_used_mb); [[ -z "$used" ]] && break
+        (( used < 2000 )) && break
+        sleep 1
+    done
+}
 trap cleanup EXIT INT TERM
 
 launch() {
@@ -99,7 +115,7 @@ for policy in $POLICIES; do
         sleep 10
     done
 
-    cleanup; SERVER_PID=""; sleep 15
+    cleanup; SERVER_PID=""
 done
 
 echo ">>> done. results in $OUTDIR"
