@@ -33,6 +33,7 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 POLICIES="${POLICIES:-fcfs uniboost}"
 QPS="${QPS:-0.25}"
+MAX_RUNNING="${MAX_RUNNING:-}"   # set to e.g. 32 to force a real wait queue
 OUTDIR="${OUTDIR:-$HERE/results/$(date +%Y%m%d-%H%M%S)}"
 
 # UniBoost knobs (match the winning simulator config)
@@ -40,6 +41,7 @@ UNIBOOST_GAMMA="${UNIBOOST_GAMMA:-3e-4}"
 UNIBOOST_K="${UNIBOOST_K:-128}"
 UNIBOOST_BETA="${UNIBOOST_BETA:-0.3}"
 UNIBOOST_ADAPTIVE="${UNIBOOST_ADAPTIVE:-1}"
+UNIBOOST_MIN_SAMPLES="${UNIBOOST_MIN_SAMPLES:-2000}"
 
 mkdir -p "$OUTDIR"
 [[ -s "$DATASET" ]] || { echo "missing $DATASET. run: python build_dataset.py --out $DATASET --total $NUM_PROMPTS"; exit 1; }
@@ -51,9 +53,11 @@ trap cleanup EXIT INT TERM
 launch() {
     local policy="$1" log="$2" extra=()
     if [[ "$policy" == "uniboost" ]]; then
-        extra+=( --uniboost-gamma "$UNIBOOST_GAMMA" --uniboost-k "$UNIBOOST_K" --uniboost-beta "$UNIBOOST_BETA" )
+        extra+=( --uniboost-gamma "$UNIBOOST_GAMMA" --uniboost-k "$UNIBOOST_K" --uniboost-beta "$UNIBOOST_BETA" \
+                 --uniboost-gamma-min-samples "$UNIBOOST_MIN_SAMPLES" )
         [[ "$UNIBOOST_ADAPTIVE" == "1" ]] && extra+=( --uniboost-adaptive-gamma )
     fi
+    [[ -n "$MAX_RUNNING" ]] && extra+=( --max-running-requests "$MAX_RUNNING" )
     python -m sglang.launch_server \
         --model-path "$MODEL" --tp "$TP" \
         --chunked-prefill-size "$CHUNK_SIZE" \
