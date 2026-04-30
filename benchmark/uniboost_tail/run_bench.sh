@@ -72,7 +72,10 @@ launch() {
     local policy="$1" log="$2" extra=()
     if [[ "$policy" == "uniboost" ]]; then
         extra+=( --uniboost-gamma "$UNIBOOST_GAMMA" --uniboost-k "$UNIBOOST_K" --uniboost-beta "$UNIBOOST_BETA" \
-                 --uniboost-gamma-min-samples "$UNIBOOST_MIN_SAMPLES" )
+                 --uniboost-gamma-min-samples "$UNIBOOST_MIN_SAMPLES" \
+                 --enable-priority-scheduling \
+                 --schedule-low-priority-values-first \
+                 --priority-scheduling-preemption-threshold 0 )
         [[ "$UNIBOOST_ADAPTIVE" == "1" ]] && extra+=( --uniboost-adaptive-gamma )
     fi
     [[ -n "$MAX_RUNNING" ]] && extra+=( --max-running-requests "$MAX_RUNNING" )

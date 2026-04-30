@@ -184,6 +184,7 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.UNIBOOST:
                 SchedulePolicy._sort_by_uniboost(
                     waiting_queue, self.uniboost_gamma, self.uniboost_k,
+                    running_batch=running_batch,
                 )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
@@ -376,9 +377,14 @@ class SchedulePolicy:
             logger.info(f"waiting_keys_after={waiting_keys_after}")
 
     @staticmethod
-    def _sort_by_uniboost(waiting_queue, gamma_default, k):
+    def _sort_by_uniboost(waiting_queue, gamma_default, k, running_batch=None):
         gamma = current_gamma(gamma_default)
-        waiting_queue.sort(key=lambda r: priority_for_req(r, gamma, k))
+        for r in waiting_queue:
+            r.priority = priority_for_req(r, gamma, k)
+        if running_batch is not None:
+            for r in running_batch.reqs:
+                r.priority = priority_for_req(r, gamma, k)
+        waiting_queue.sort(key=lambda r: r.priority)
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
