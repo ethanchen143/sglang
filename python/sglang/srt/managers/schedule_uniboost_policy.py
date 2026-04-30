@@ -16,6 +16,8 @@ from typing import Deque, Optional
 
 import numpy as np
 
+from sglang.srt.managers import uniboost_trace
+
 
 # --- helper functions --------------------------
 def boost(x: float, gamma: float) -> float:
@@ -96,6 +98,7 @@ class GammaAdaptiveTracker:
         self._gamma = min(max(self._gamma, self._gamma_min), self._gamma_max)
         n = len(self._latencies)
         print(f"[uniboost] gamma update: n={n} raw={raw:.6g} prev={prev:.6g} new={self._gamma:.6g}", flush=True)
+        uniboost_trace.log_gamma_update(n=n, raw=raw, prev=prev, new=self._gamma)
         return self._gamma
 
     def _estimate(self) -> Optional[float]:

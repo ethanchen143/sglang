@@ -28,14 +28,14 @@ MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
 TP="${TP:-1}"
 CHUNK_SIZE="${CHUNK_SIZE:-1024}"
 DATASET="${DATASET:-$HERE/mix.jsonl}"
-NUM_PROMPTS="${NUM_PROMPTS:-1000}"
+NUM_PROMPTS="${NUM_PROMPTS:-5000}"
 WARMUP="${WARMUP:-20}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 POLICIES="${POLICIES:-fcfs uniboost}"
-QPS="${QPS:-8}"
-MAX_RUNNING="${MAX_RUNNING:-32}"   # set to e.g. 64 to force a real wait queue
-MEM_FRACTION="${MEM_FRACTION:-}"   # e.g. 0.80 to cap KV-cache memory; empty = sglang default
+QPS="${QPS:-16}"
+MAX_RUNNING="${MAX_RUNNING:-}"   # set to e.g. 64 to force a real wait queue
+MEM_FRACTION="${MEM_FRACTION:-0.2}"   # e.g. 0.80 to cap KV-cache memory; empty = sglang default
 OUTDIR="${OUTDIR:-$HERE/results/$(date)}"
 
 # UniBoost knobs (match the winning simulator config)
@@ -43,7 +43,7 @@ UNIBOOST_GAMMA="${UNIBOOST_GAMMA:-3e-4}"
 UNIBOOST_K="${UNIBOOST_K:-128}"
 UNIBOOST_BETA="${UNIBOOST_BETA:-0.3}"
 UNIBOOST_ADAPTIVE="${UNIBOOST_ADAPTIVE:-1}"
-UNIBOOST_MIN_SAMPLES="${UNIBOOST_MIN_SAMPLES:-200}"
+UNIBOOST_MIN_SAMPLES="${UNIBOOST_MIN_SAMPLES:-500}"
 
 mkdir -p "$OUTDIR"
 [[ -s "$DATASET" ]] || { echo "missing $DATASET. run: python build_dataset.py --out $DATASET --total $NUM_PROMPTS"; exit 1; }
@@ -77,6 +77,8 @@ launch() {
     fi
     [[ -n "$MAX_RUNNING" ]] && extra+=( --max-running-requests "$MAX_RUNNING" )
     [[ -n "$MEM_FRACTION" ]] && extra+=( --mem-fraction-static "$MEM_FRACTION" )
+    UNIBOOST_TRACE_DIR="$OUTDIR" \
+    UNIBOOST_TRACE_TAG="$policy" \
     python -m sglang.launch_server \
         --model-path "$MODEL" --tp "$TP" \
         --chunked-prefill-size "$CHUNK_SIZE" \

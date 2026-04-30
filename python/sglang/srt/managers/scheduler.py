@@ -168,6 +168,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers import uniboost_trace
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -2608,6 +2609,15 @@ class Scheduler(
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
+            uniboost_trace.log_preempt(
+                kind="priority",
+                policy=self.policy.policy if hasattr(self, "policy") else None,
+                num_preempted=len(adder.preempt_list),
+                num_input_tokens=sum(len(r.origin_input_ids) for r in adder.preempt_list),
+                num_output_tokens=sum(len(r.output_ids) for r in adder.preempt_list),
+                running_bs=len(self.running_batch.reqs),
+                waiting_queue_len=len(self.waiting_queue),
+            )
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
@@ -2718,6 +2728,19 @@ class Scheduler(
             )
 
             self.num_retracted_reqs = len(retracted_reqs)
+            if len(retracted_reqs) > 0:
+                uniboost_trace.log_preempt(
+                    kind="kv_full" if kv_full_retract_flag else "test",
+                    policy=self.policy.policy if hasattr(self, "policy") else None,
+                    num_retracted=len(retracted_reqs),
+                    num_aborted=len(reqs_to_abort),
+                    num_input_tokens=sum(len(r.origin_input_ids) for r in retracted_reqs),
+                    num_output_tokens=sum(len(r.output_ids) for r in retracted_reqs),
+                    new_tokens_gained=int(new_token_gained),
+                    new_token_ratio=float(new_token_ratio),
+                    running_bs=batch.batch_size(),
+                    waiting_queue_len=len(self.waiting_queue),
+                )
             if self.enable_metrics and len(retracted_reqs) > 0:
                 self.metrics_collector.increment_retracted_reqs(
                     num_retracted_reqs=len(retracted_reqs),
