@@ -6722,7 +6722,8 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+                "uniboost",
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof', or 'uniboost'. '{self.schedule_policy}' is not supported."
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
