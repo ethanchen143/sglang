@@ -27,21 +27,21 @@ MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
 TP="${TP:-1}"
 CHUNK_SIZE="${CHUNK_SIZE:-1024}"
 DATASET="${DATASET:-$HERE/mix.jsonl}"
-NUM_PROMPTS="${NUM_PROMPTS:-10000}"
+NUM_PROMPTS="${NUM_PROMPTS:-1000}"
 WARMUP="${WARMUP:-20}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 POLICIES="${POLICIES:-fcfs uniboost}"
-QPS="${QPS:-0.25}"
-MAX_RUNNING="${MAX_RUNNING:-}"   # set to e.g. 32 to force a real wait queue
-OUTDIR="${OUTDIR:-$HERE/results/$(date +%Y%m%d-%H%M%S)}"
+QPS="${QPS:-8}"
+MAX_RUNNING="${MAX_RUNNING:-32}"   # set to e.g. 64 to force a real wait queue
+OUTDIR="${OUTDIR:-$HERE/results/$(date)}"
 
 # UniBoost knobs (match the winning simulator config)
 UNIBOOST_GAMMA="${UNIBOOST_GAMMA:-3e-4}"
 UNIBOOST_K="${UNIBOOST_K:-128}"
 UNIBOOST_BETA="${UNIBOOST_BETA:-0.3}"
 UNIBOOST_ADAPTIVE="${UNIBOOST_ADAPTIVE:-1}"
-UNIBOOST_MIN_SAMPLES="${UNIBOOST_MIN_SAMPLES:-2000}"
+UNIBOOST_MIN_SAMPLES="${UNIBOOST_MIN_SAMPLES:-200}"
 
 mkdir -p "$OUTDIR"
 [[ -s "$DATASET" ]] || { echo "missing $DATASET. run: python build_dataset.py --out $DATASET --total $NUM_PROMPTS"; exit 1; }
