@@ -52,7 +52,7 @@ def _write(fh: Optional[TextIO], record: dict) -> None:
     record.setdefault("t", time.time())
     try:
         with _LOCK:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+            fh.write(json.dumps(record, separators=(",", ":"), default=str) + "\n")
     except (OSError, ValueError):
         pass
 
