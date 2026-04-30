@@ -91,8 +91,11 @@ class GammaAdaptiveTracker:
         if raw is None:
             return None
         # EMA smoothing, then clip to bounds.
+        prev = self._gamma
         self._gamma = (1.0 - self._beta) * self._gamma + self._beta * raw
         self._gamma = min(max(self._gamma, self._gamma_min), self._gamma_max)
+        n = len(self._latencies)
+        print(f"[uniboost] gamma update: n={n} raw={raw:.6g} prev={prev:.6g} new={self._gamma:.6g}", flush=True)
         return self._gamma
 
     def _estimate(self) -> Optional[float]:

@@ -19,6 +19,7 @@
 #
 #   # knobs via env:
 #   POLICIES="fcfs uniboost"  QPS="0.20 0.24 0.28"  NUM_PROMPTS=2000  ./run_bench.sh
+#   MEM_FRACTION=0.80  QPS="4 8 12"  ./run_bench.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +35,7 @@ PORT="${PORT:-30000}"
 POLICIES="${POLICIES:-fcfs uniboost}"
 QPS="${QPS:-8}"
 MAX_RUNNING="${MAX_RUNNING:-32}"   # set to e.g. 64 to force a real wait queue
+MEM_FRACTION="${MEM_FRACTION:-}"   # e.g. 0.80 to cap KV-cache memory; empty = sglang default
 OUTDIR="${OUTDIR:-$HERE/results/$(date)}"
 
 # UniBoost knobs (match the winning simulator config)
@@ -74,6 +76,7 @@ launch() {
         [[ "$UNIBOOST_ADAPTIVE" == "1" ]] && extra+=( --uniboost-adaptive-gamma )
     fi
     [[ -n "$MAX_RUNNING" ]] && extra+=( --max-running-requests "$MAX_RUNNING" )
+    [[ -n "$MEM_FRACTION" ]] && extra+=( --mem-fraction-static "$MEM_FRACTION" )
     python -m sglang.launch_server \
         --model-path "$MODEL" --tp "$TP" \
         --chunked-prefill-size "$CHUNK_SIZE" \
