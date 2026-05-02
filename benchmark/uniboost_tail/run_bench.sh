@@ -33,9 +33,9 @@ WARMUP="${WARMUP:-20}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 POLICIES="${POLICIES:-fcfs uniboost}"
-QPS="${QPS:-16}"
-MAX_RUNNING="${MAX_RUNNING:-}"   # set to e.g. 64 to force a real wait queue
-MEM_FRACTION="${MEM_FRACTION:-0.2}"   # e.g. 0.80 to cap KV-cache memory; empty = sglang default
+QPS="${QPS:-8}"
+MAX_RUNNING="${MAX_RUNNING:-64}"   # set to e.g. 64 to force a real wait queue
+MEM_FRACTION="${MEM_FRACTION:-0.8}"   # e.g. 0.80 to cap KV-cache memory; empty = sglang default
 OUTDIR="${OUTDIR:-$HERE/results/$(date)}"
 
 # UniBoost knobs (match the winning simulator config)
