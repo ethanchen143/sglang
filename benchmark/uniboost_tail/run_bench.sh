@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduce the UniBoost Table 2 / Fig. 5 experiment on sglang.
 #
-# Workload: 70% s1K reasoning + 30% ShareGPT, Llama-3-8B TP=1, Poisson arrivals.
+# Workload: synthetic log-normal prompt/output lengths, Llama-3-8B TP=1, Poisson arrivals.
 # Metric:   per-request ttft and latency (sglang.bench_serving already prints
 #           mean / median / p95 / p99).
 #
@@ -47,6 +47,13 @@ UNIBOOST_MIN_SAMPLES="${UNIBOOST_MIN_SAMPLES:-500}"
 
 mkdir -p "$OUTDIR"
 [[ -s "$DATASET" ]] || { echo "missing $DATASET. run: python build_dataset.py --out $DATASET --total $NUM_PROMPTS"; exit 1; }
+have=$(wc -l < "$DATASET")
+if (( have < NUM_PROMPTS )); then
+    echo "dataset $DATASET has $have prompts, NUM_PROMPTS=$NUM_PROMPTS."
+    echo "rebuild: python build_dataset.py --out $DATASET --total $NUM_PROMPTS"
+    exit 1
+fi
+echo ">>> using dataset $DATASET ($have prompts)"
 
 SERVER_PID=""
 gpu_used_mb() {

@@ -1,7 +1,10 @@
 ## UniBoost tail-latency benchmark
 
 - **Model:** Llama-3-8B, TP=1
-- **Workload:** 70% `simplescaling/s1K` (reasoning) + 30% ShareGPT (chat), shuffled
+- **Workload:** synthetic — prompt and output lengths drawn from independent
+  log-normal distributions (defaults: prompt median 256 / sigma 0.8,
+  output median 512 / sigma 1.2). Fixed distribution makes offered load and
+  tail behavior analytically tractable.
 - **Load:** Poisson arrivals at a target QPS (single value or sweep)
 - **Metrics:** TTFT and end-to-end latency (mean, median, P95, P99) —
   computed by `sglang.bench_serving` directly
@@ -19,8 +22,9 @@ The only thing this directory adds is the mixture builder.
 ### Prereqs
 
 - GPU with ≥40GB VRAM for Llama-3-8B FP16 (paper uses A100 80GB)
-- `pip install datasets` for the dataset pull
-- `huggingface-cli login` for gated Llama weights
+- `pip install transformers numpy` for synthetic dataset generation
+- `huggingface-cli login` for gated Llama weights (the builder uses the
+  Llama tokenizer to materialize prompts/completions at exact target lengths)
 - sglang with the UniBoost patch applied (see `../../python/sglang/srt/managers/uniboost_policy.py`).
   The script auto-skips `uniboost` if the `--uniboost-gamma` flag isn't present.
 
@@ -28,6 +32,10 @@ The only thing this directory adds is the mixture builder.
 
 ```bash
 python build_dataset.py --out mix.jsonl --total 10000
+# customize the distribution:
+python build_dataset.py --out mix.jsonl --total 10000 \
+    --prompt-median 256 --prompt-sigma 0.8 \
+    --output-median 512 --output-sigma 1.2
 ```
 
 ### Run the sweep
